@@ -1,19 +1,15 @@
-# Builds Mugetsu from source/ on GitHub's Windows, Linux and macOS machines.
+# Builds Mugetsu for Linux (Wayland) from source/ on GitHub's Linux machines.
 #
-# - Every change to source/ on main, and every pull request that changes it: test builds,
+# - Every change to source/ on wayland, and every pull request that changes it: test builds,
 #   downloadable from the run's page.
 # - Actions > Build Mugetsu > Run workflow, with "Create a draft release" ticked: also makes a
-#   draft release with the Windows zips and Linux archives (normal, and x86-64-v2 for CPUs
-#   without AVX2), the macOS zip and their SHA-256
-#   (notes from source/notes/<version>.md), to check and publish by hand.
-#   "Skip macOS" (for when GitHub has no Mac free): the draft has Windows and Linux only, and
-#   the notes' macOS lines are left out. "Add macOS to the existing release" later builds only
-#   the Mac app and uploads it to that release (put the macOS lines back into its notes then).
+#   draft release with the Linux archives (normal, and x86-64-v2 for CPUs without AVX2) and
+#   their SHA-256 (notes from source/notes/<version>.md), to check and publish by hand.
 name: Build Mugetsu
 
 on:
   push:
-    branches: [main]
+    branches: [wayland]
     paths: ['source/**', '.github/workflows/build.yml']
   pull_request:
     paths: ['source/**', '.github/workflows/build.yml']
@@ -23,110 +19,18 @@ on:
         description: 'Create a draft release'
         type: boolean
         default: false
-      skip_macos:
-        description: 'Skip macOS (draft with Windows and Linux only)'
-        type: boolean
-        default: false
-      attach_macos:
-        description: 'Add macOS to the existing release (builds only the Mac app)'
-        type: boolean
-        default: false
 
 # Read-only by default (pull requests run with this); only the release job writes.
 permissions:
   contents: read
 
 jobs:
-  windows:
-    # Two builds, like Linux: the normal one (x86-64-v3, needs AVX2) and one for CPUs without
-    # AVX2, released as Mugetsu-<ver>-windows-x86-64-v2.zip. Only the normal build sets the outputs.
-    if: ${{ !inputs.attach_macos }}
-    name: windows${{ matrix.suffix }}
-    runs-on: windows-latest
-    timeout-minutes: 240
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - suffix: ''
-            cpu: x86-64-v3
-            features: ''
-          - suffix: -x86-64-v2
-            cpu: x86-64-v2
-            features: +avx,+fma,+f16c
-    outputs:
-      version: ${{ steps.package.outputs.version }}
-      sha: ${{ steps.package.outputs.sha }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust
-        shell: pwsh
-        run: |
-          $version = (Get-Content source/RUST_VERSION -Raw).Trim()
-          rustup toolchain install $version --profile minimal --no-self-update
-          rustup default $version
-          rustc --version
-
-      - name: Install Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Build
-        shell: pwsh
-        env:
-          MUGETSU_TARGET_CPU: ${{ matrix.cpu }}
-          MUGETSU_TARGET_FEATURES: ${{ matrix.features }}
-        run: ./source/build-windows.ps1
-
-      - name: Package
-        id: package
-        shell: pwsh
-        env:
-          SUFFIX: ${{ matrix.suffix }}
-        run: |
-          $source = Get-Content source/build/ruffle/desktop/src/mugetsu.rs -Raw
-          $version = [regex]::Match($source, 'pub const VERSION: &str = "([^"]+)"').Groups[1].Value
-          $dir = 'package/Mugetsu'
-          New-Item -ItemType Directory -Force "$dir/LICENSES" | Out-Null
-          Copy-Item source/build/out/Mugetsu.exe $dir
-          Copy-Item source/release/* $dir -Recurse -Force
-          Copy-Item LICENSE "$dir/LICENSES/Mugetsu-LICENSE-GPL-3.0.txt"
-          New-Item -ItemType Directory -Force release | Out-Null
-          $zip = "Mugetsu-$version-windows$env:SUFFIX.zip"
-          Compress-Archive -Path $dir -DestinationPath "release/$zip"
-          $zipHash = (Get-FileHash "release/$zip" -Algorithm SHA256).Hash
-          $exeHash = (Get-FileHash "$dir/Mugetsu.exe" -Algorithm SHA256).Hash
-          "Mugetsu $version ($zip)"
-          "zip SHA-256: $zipHash"
-          "exe SHA-256: $exeHash"
-          if (-not $env:SUFFIX) {
-            "version=$version" >> $env:GITHUB_OUTPUT
-            "sha=$zipHash" >> $env:GITHUB_OUTPUT
-          }
-          # For the test-build artifact's name (the job outputs above are the normal build's only).
-          "artifact=Mugetsu-$version$env:SUFFIX" >> $env:GITHUB_OUTPUT
-          "## Mugetsu $version (Windows$env:SUFFIX)`n`nzip SHA-256: ``$zipHash```nMugetsu.exe SHA-256: ``$exeHash``" >> $env:GITHUB_STEP_SUMMARY
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: ${{ steps.package.outputs.artifact }}
-          path: package
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-windows${{ matrix.suffix }}
-          path: release
-
   linux:
     # The oldest supported Ubuntu runner: the program then runs on systems from about 2022 on
     # (it needs the C library of the system it was built on, or newer).
     # Two builds: the normal one (x86-64-v3, needs AVX2) and one for CPUs without AVX2
     # (x86-64-v2 with AVX, FMA and F16C), released as Mugetsu-<ver>-linux-x86-64-v2.tar.gz.
     # Only the normal build sets the job's outputs, so the release notes use its SHA-256.
-    if: ${{ !inputs.attach_macos }}
     name: linux${{ matrix.suffix }}
     runs-on: ubuntu-22.04
     timeout-minutes: 240
@@ -182,7 +86,7 @@ jobs:
           cp source/release-linux/* "$dir/"
           cp source/release/LICENSES/* "$dir/LICENSES/"
           cp LICENSE "$dir/LICENSES/Mugetsu-LICENSE-GPL-3.0.txt"
-          archive="Mugetsu-$version-linux$SUFFIX.tar.gz"
+          archive="linux$SUFFIX.tar.gz"
           # A tar archive keeps the program's "executable" mark (a zip wouldn't).
           tar -C package --owner=0 --group=0 --numeric-owner -czf "release/$archive" Mugetsu
           hash=$(sha256sum "release/$archive" | cut -d' ' -f1 | tr a-f A-F)
@@ -201,69 +105,9 @@ jobs:
           name: release-linux${{ matrix.suffix }}
           path: release
 
-  macos:
-    # Apple silicon runner, pinned on purpose: macos-latest is macOS 26 now and macos-14
-    # (the previous Apple silicon image) is retired on 2 November 2026. The app is built
-    # universal, so one zip runs on both Apple silicon and Intel Macs; its deployment
-    # target (macOS 11.0) comes from build-macos.sh, not from the runner.
-    if: ${{ !inputs.skip_macos }}
-    runs-on: macos-15
-    timeout-minutes: 360
-    outputs:
-      version: ${{ steps.package.outputs.version }}
-      sha: ${{ steps.package.outputs.sha }}
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust
-        run: |
-          version=$(tr -d '[:space:]' < source/RUST_VERSION)
-          rustup toolchain install "$version" --profile minimal --no-self-update
-          rustup default "$version"
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
-          rustc --version
-
-      - name: Install Java
-        uses: actions/setup-java@v5
-        with:
-          distribution: temurin
-          java-version: '21'
-
-      - name: Build
-        run: bash source/build-macos.sh --universal
-
-      - name: Package
-        id: package
-        run: |
-          version=$(sed -n 's/^pub const VERSION: &str = "\([^"]*\)";.*/\1/p' source/build/ruffle/desktop/src/mugetsu.rs)
-          app=source/build/out/Mugetsu.app
-          zip="source/build/out/Mugetsu-$version-macos-universal.zip"
-          test -d "$app"
-          test -f "$zip"
-          # Both slices in the one binary, and the ad-hoc signature is intact.
-          lipo -archs "$app/Contents/MacOS/Mugetsu"
-          codesign --verify --deep --strict "$app"
-          mkdir -p release
-          cp "$zip" release/
-          hash=$(shasum -a 256 "release/Mugetsu-$version-macos-universal.zip" | cut -d' ' -f1 | tr a-f A-F)
-          echo "Mugetsu $version"
-          echo "zip SHA-256: $hash"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "sha=$hash" >> "$GITHUB_OUTPUT"
-          printf '## Mugetsu %s (macOS)\n\nzip SHA-256: `%s`\n' "$version" "$hash" >> "$GITHUB_STEP_SUMMARY"
-
-      - uses: actions/upload-artifact@v6
-        with:
-          name: release-macos
-          path: release
-
   release:
-    # Without macOS when it's skipped; `!cancelled()` lets this run after a skipped job.
-    if: >-
-      ${{ !cancelled() && inputs.release && !inputs.attach_macos
-      && needs.windows.result == 'success' && needs.linux.result == 'success'
-      && (inputs.skip_macos || needs.macos.result == 'success') }}
-    needs: [windows, linux, macos]
+    if: ${{ inputs.release && needs.linux.result == 'success' }}
+    needs: [linux]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -279,49 +123,10 @@ jobs:
       - name: Draft release
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.windows.outputs.version }}
-          LINUX_VERSION: ${{ needs.linux.outputs.version }}
-          MACOS_VERSION: ${{ needs.macos.outputs.version }}
-          SHA: ${{ needs.windows.outputs.sha }}
+          VERSION: ${{ needs.linux.outputs.version }}
           LINUX_SHA: ${{ needs.linux.outputs.sha }}
-          MACOS_SHA: ${{ needs.macos.outputs.sha }}
-          SKIP_MACOS: ${{ inputs.skip_macos }}
         run: |
-          if [ "$SKIP_MACOS" = true ]; then MACOS_VERSION=$VERSION; fi
-          if [ "$VERSION" != "$LINUX_VERSION" ] || [ "$VERSION" != "$MACOS_VERSION" ]; then
-            echo "Versions differ: Windows ($VERSION), Linux ($LINUX_VERSION), macOS ($MACOS_VERSION)"; exit 1
-          fi
           notes="source/notes/$VERSION.md"
           if [ ! -f "$notes" ]; then echo "Missing release notes: $notes"; exit 1; fi
-          # LINUX_SHA_PLACEHOLDER and MACOS_SHA_PLACEHOLDER first: they contain SHA_PLACEHOLDER.
-          sed -e "s/LINUX_SHA_PLACEHOLDER/$LINUX_SHA/g" \
-              -e "s/MACOS_SHA_PLACEHOLDER/$MACOS_SHA/g" \
-              -e "s/SHA_PLACEHOLDER/$SHA/g" "$notes" > notes.md
-          if [ "$SKIP_MACOS" = true ]; then
-            # The macOS download and SHA lines, the "macOS version" paragraph, its VirusTotal link.
-            sed -i -e '/macos-universal/d' -e '/^\*\*macOS version\*\*$/,/^$/d' \
-                -e 's/ · \[macOS zip\](VT_MACOS)//' notes.md
-          fi
+          sed -e "s/LINUX_SHA_PLACEHOLDER/$LINUX_SHA/g" "$notes" > notes.md
           gh release create "v$VERSION" release/* --draft --title "Mugetsu $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
-
-  attach-macos:
-    if: ${{ inputs.attach_macos && needs.macos.result == 'success' }}
-    needs: [macos]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v7
-        with:
-          name: release-macos
-          path: release
-
-      - name: Add to the release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-          VERSION: ${{ needs.macos.outputs.version }}
-          MACOS_SHA: ${{ needs.macos.outputs.sha }}
-        run: |
-          gh release upload "v$VERSION" release/* --clobber
-          printf '## Added to v%s\n\n`Mugetsu-%s-macos-universal.zip`: `%s`\n' "$VERSION" "$VERSION" "$MACOS_SHA" >> "$GITHUB_STEP_SUMMARY"
