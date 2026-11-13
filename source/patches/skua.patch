@@ -1,17 +1,5 @@
-diff --git a/Cargo.lock b/Cargo.lock
-index 3d9b65e..e843f32 100644
---- a/Cargo.lock
-+++ b/Cargo.lock
-@@ -5017,6 +5017,7 @@ dependencies = [
-  "windows-sys 0.61.2",
-  "winit",
-  "winresource",
-+ "x11-dl",
- ]
- 
- [[package]]
 diff --git a/core/src/avm2/globals/json.rs b/core/src/avm2/globals/json.rs
-index 43e1962..4f3b31c 100644
+index 43e19628..4f3b31c5 100644
 --- a/core/src/avm2/globals/json.rs
 +++ b/core/src/avm2/globals/json.rs
 @@ -181,7 +181,20 @@ impl<'gc> AvmSerializer<'gc> {
@@ -45,29 +33,38 @@ index 43e1962..4f3b31c 100644
              Value::Number(n) => JsonValue::from(n),
              Value::Bool(b) => JsonValue::from(b),
              Value::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),
-diff --git a/desktop/Cargo.toml b/desktop/Cargo.toml
-index b36589f..3dbc2ed 100644
---- a/desktop/Cargo.toml
-+++ b/desktop/Cargo.toml
-@@ -70,6 +70,8 @@ fontconfig = { version = "0.11.0", optional = true }
- 
- [target.'cfg(target_os = "linux")'.dependencies]
- ashpd = { version = "0.13.0", features = ["settings", "game_mode"] }
-+# Skua build: keyboard focus for the window embedded in Bonxie (see `skua::take_focus`).
-+x11-dl = "2.21"
- 
- [target.'cfg(windows)'.dependencies]
- # AQW build: DXGI, to see which graphics chip Mugetsu will use (see `mugetsu::intel_graphics`).
 diff --git a/desktop/src/app.rs b/desktop/src/app.rs
-index a5f7bc2..c3cd08a 100644
+index a5f7bc25..a2c1f6cc 100644
 --- a/desktop/src/app.rs
 +++ b/desktop/src/app.rs
-@@ -498,7 +498,24 @@ impl MainWindow {
+@@ -421,8 +421,7 @@ fn timer_parts(before: &[u64; ruffle_render_wgpu::perf_counters::timers::LEN]) -
+ }
+ 
+ impl MainWindow {
+-    pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
+-        if matches!(event, WindowEvent::RedrawRequested) {
++    fn render_frame(&mut self) {
+             // Don't render when nobody can see the result: while minimized, the
+             // surface also keeps the size it had before, as `GuiController::resize`
+             // refuses to reconfigure it to a zero size.
+@@ -492,13 +491,36 @@ impl MainWindow {
+                     }
+                 }
+             }
++    }
++
++    pub fn window_event(&mut self, event_loop: &ActiveEventLoop, event: WindowEvent) {
++        if matches!(event, WindowEvent::RedrawRequested) {
++            self.render_frame();
+ 
+             // Important that we return here, or we'll get a feedback loop with egui
+             // (winit says redraw, egui hears redraw and says redraw, we hear redraw and tell winit to redraw...)
              return;
          }
  
 -        if self.gui.handle_event(&event) {
-+        let embedded_mouse_event = self.preferences.cli.skua_parent.is_some()
++        let embedded = crate::skua::shm_active();
++        let embedded_mouse_event = embedded
 +            && matches!(
 +                &event,
 +                WindowEvent::CursorMoved { .. }
@@ -76,7 +73,7 @@ index a5f7bc2..c3cd08a 100644
 +                    | WindowEvent::MouseInput { .. }
 +                    | WindowEvent::MouseWheel { .. }
 +            );
-+        let embedded_dialog = self.preferences.cli.skua_parent.is_some()
++        let embedded_dialog = embedded
 +            && self.gui.is_open_url_dialog_visible();
 +        if embedded_mouse_event && embedded_dialog {
 +            let _ = self.gui.handle_event(&event);
@@ -88,29 +85,229 @@ index a5f7bc2..c3cd08a 100644
              // Event consumed by GUI.
              return;
          }
-@@ -588,6 +605,11 @@ impl MainWindow {
-                 // Keep MouseMove -> MouseDown ordering and an up-to-date hover target.
-                 self.flush_mouse_move();
+@@ -534,23 +556,26 @@ impl MainWindow {
+                 self.minimized = size.width == 0 && size.height == 0;
  
-+                // Skua build: a clicked child window doesn't get the keyboard by itself.
-+                if state == ElementState::Released && self.preferences.cli.skua_parent.is_some() {
-+                    crate::skua::take_focus(self.gui.window());
+                 if let Some(mut player) = self.player.get() {
+-                    let viewport_scale_factor = self.gui.window().scale_factor();
++                    let viewport_scale_factor = self.gui.window().map_or(1.0, |w| w.scale_factor());
+                     player.set_viewport_dimensions(ViewportDimensions {
+                         width: size.width,
+                         height: size.height.saturating_sub(self.gui.height_offset() as u32),
+                         scale_factor: viewport_scale_factor,
+                     });
+                 }
+-                self.gui.window().request_redraw();
++                if crate::skua::shm_active() {
++                    self.frame_since_render = true;
 +                }
-+
-                 use ruffle_core::events::MouseButton as RuffleMouseButton;
-                 use winit::event::MouseButton;
-                 let (x, y) = self.gui.window_to_movie_position(self.mouse_pos);
-@@ -777,7 +799,8 @@ impl MainWindow {
++                self.gui.request_redraw();
+                 if matches!(self.loaded, LoadingState::WaitingForResize) {
+                     self.loaded = LoadingState::Loaded;
+                 }
+             }
+             WindowEvent::Occluded(occluded) => {
+                 self.occluded = occluded;
+                 if !occluded {
+                     // Nothing repaints us on its own if the movie is paused.
+-                    self.gui.window().request_redraw();
++                    self.gui.request_redraw();
+                 }
+             }
+             WindowEvent::CursorMoved { position, .. } => {
+@@ -609,7 +636,11 @@ impl MainWindow {
+                     ElementState::Released => PlayerEvent::MouseUp { x, y, button },
+                 };
+                 let handled = self.player.handle_event(event);
+-                if !handled && state == ElementState::Pressed && button == RuffleMouseButton::Right
++                // Skua build: always offer Mugetsu's menu from an embedded child. The movie can
++                // report the right button as handled even though Bonxie still needs this menu.
++                if (!handled || crate::skua::shm_active())
++                    && state == ElementState::Pressed
++                    && button == RuffleMouseButton::Right
+                 {
+                     // Show context menu.
+                     if let Some(mut player) = self.player.get() {
+@@ -653,8 +680,8 @@ impl MainWindow {
+             WindowEvent::CursorEntered { .. } => {
+                 if let Some(mut player) = self.player.get() {
+                     player.set_mouse_in_stage(true);
+                     if player.needs_render() {
+-                        self.gui.window().request_redraw();
++                        self.gui.request_redraw();
+                     }
+                 }
+             }
+@@ -743,45 +770,57 @@ impl MainWindow {
+                 ruffle_core::frame_interpolation::set_enabled(on);
+                 mugetsu::save_interpolation(on);
+                 tracing::info!("Frame interpolation turned {}", if on { "on" } else { "off" });
+                 #[cfg(windows)]
+-                crate::windows::sync_menu_checks(self.gui.window());
++                if let Some(window) = self.gui.window() {
++                    crate::windows::sync_menu_checks(window);
++                }
+             }
+             Setting::FlashEdges(on) => {
+                 ruffle_render::tessellator::set_flash_aa(on);
+                 mugetsu::save_flash_edges(on);
+                 // The drawing surface is made again for it (and shapes tessellated again).
+                 if let Some(mut player) = self.player.get() {
+                     let quality = player.quality();
+                     player.renderer_mut().set_quality(quality);
+                 }
+-                self.gui.window().request_redraw();
++                if crate::skua::shm_active() {
++                    self.frame_since_render = true;
++                }
++                self.gui.request_redraw();
+             }
+             Setting::Graphics(choice) => {
+-                #[cfg(windows)]
+-                crate::windows::choose_graphics(self.gui.window(), choice);
+-                #[cfg(target_os = "linux")]
+-                crate::linux::choose_graphics(self.gui.window(), choice);
++                #[cfg(windows)]
++                if let Some(window) = self.gui.window() {
++                    crate::windows::choose_graphics(window, choice);
++                }
++                #[cfg(target_os = "linux")]
++                crate::linux::choose_graphics(self.gui.window().map(|w| w.as_ref()), choice);
+                 #[cfg(not(any(windows, target_os = "linux")))]
+                 let _ = choice;
+             }
+             Setting::ShowFps(on) => {
+                 mugetsu::set_show_fps(on);
+-                self.gui.window().request_redraw();
++                if crate::skua::shm_active() {
++                    self.frame_since_render = true;
++                }
++                self.gui.request_redraw();
+             }
+             Setting::OpenLogFolder => mugetsu::open_log_folder(),
+         }
+     }
+ 
+     fn on_metadata(&mut self, swf_header: HeaderExt) {
+-        let height_offset = if self.gui.window().fullscreen().is_some() || self.no_gui {
++        let height_offset = if self.gui.window().is_none_or(|w| w.fullscreen().is_some()) || self.no_gui {
+             0.0
+         } else {
+             MENU_HEIGHT as f64
+         };
  
          // To prevent issues like waiting on resize indefinitely (#11364) or desyncing the window state on Windows,
          // do not resize while window is maximized.
 -        let should_resize = !self.gui.window().is_maximized();
 +        let should_resize =
-+            !self.gui.window().is_maximized() && self.preferences.cli.skua_parent.is_none();
++            self.gui.window().is_some_and(|w| !w.is_maximized()) && !crate::skua::shm_active();
  
          let (viewport_size, state) = if should_resize {
++            let window = self.gui.window().expect("window exists when resizing").clone();
              let movie_width = swf_header.stage_size().width().to_pixels();
-@@ -864,7 +887,28 @@ impl MainWindow {
+@@ -793,73 +826,86 @@ impl MainWindow {
+                 (Some(width), None) => {
+                     let scale = width / movie_width;
+                     let height = movie_height * scale;
+                     PhysicalSize::new(
+                         width.max(1.0),
+-                        height.max(1.0) + height_offset * self.gui.window().scale_factor(),
++                        height.max(1.0) + height_offset * window.scale_factor(),
+                     )
+                     .into()
+                 }
+                 (None, Some(height)) => {
+                     let scale = height / movie_height;
+                     let width = movie_width * scale;
+                     PhysicalSize::new(
+                         width.max(1.0),
+-                        height.max(1.0) + height_offset * self.gui.window().scale_factor(),
++                        height.max(1.0) + height_offset * window.scale_factor(),
+                     )
+                     .into()
+                 }
+                 (Some(width), Some(height)) => PhysicalSize::new(
+                     width.max(1.0),
+-                    height.max(1.0) + height_offset * self.gui.window().scale_factor(),
++                    height.max(1.0) + height_offset * window.scale_factor(),
+                 )
+                 .into(),
+             };
+ 
+             let window_size = Size::clamp(
+                 window_size,
+                 self.min_window_size.into(),
+                 self.max_window_size.into(),
+-                self.gui.window().scale_factor(),
++                window.scale_factor(),
+             );
+ 
+-            let viewport_size = self.gui.window().inner_size();
++            let viewport_size = window.inner_size();
+             let mut window_resize_denied = false;
+ 
+-            if let Some(new_viewport_size) = self.gui.window().request_inner_size(window_size) {
++            if let Some(new_viewport_size) = window.request_inner_size(window_size) {
+                 if new_viewport_size != viewport_size {
+                     self.gui.resize(new_viewport_size);
+                 } else {
+                     tracing::warn!("Unable to resize window");
+                     window_resize_denied = true;
+                 }
+             }
+ 
+-            let viewport_size = self.gui.window().inner_size();
++            let viewport_size = window.inner_size();
+ 
+             // On X11 (and possibly other platforms), the window size is not updated immediately.
+             // On a successful resize request, wait for the window to be resized to the requested size
+             // before we start running the SWF (which can observe the viewport size in "noScale" mode)
+             let state = if !window_resize_denied && window_size != viewport_size.into() {
+                 LoadingState::WaitingForResize
+             } else {
+                 LoadingState::Loaded
+             };
+ 
+             (viewport_size, state)
++        } else if crate::skua::shm_active() {
++            (winit::dpi::PhysicalSize::new(960, 550), LoadingState::Loaded)
+         } else {
+-            (self.gui.window().inner_size(), LoadingState::Loaded)
++            (
++                self.gui.window().expect("window exists").inner_size(),
++                LoadingState::Loaded,
++            )
+         };
+ 
+         self.loaded = state;
+ 
+-        self.gui.window().set_fullscreen(if self.start_fullscreen {
+-            Some(Fullscreen::Borderless(None))
+-        } else {
+-            None
+-        });
+-        self.gui.window().set_visible(true);
++        if !crate::skua::shm_active() {
++            if let Some(window) = self.gui.window() {
++                window.set_fullscreen(if self.start_fullscreen {
++                    Some(Fullscreen::Borderless(None))
++                } else {
++                    None
++                });
++                window.set_visible(true);
++            }
++        }
+ 
+-        let viewport_scale_factor = self.gui.window().scale_factor();
++        let viewport_scale_factor = if crate::skua::shm_active() {
++            1.0
++        } else {
++            self.gui.window().map_or(1.0, |w| w.scale_factor())
++        };
+         if let Some(mut player) = self.player.get() {
+             player.set_viewport_dimensions(ViewportDimensions {
+                 width: viewport_size.width,
+@@ -864,7 +905,175 @@ impl MainWindow {
          }
      }
  
@@ -130,6 +327,153 @@ index a5f7bc2..c3cd08a 100644
 +        }
 +    }
 +
++    /// Skua build: runs forwarded input events from Bonxie in `--skua-shm` mode.
++    fn run_skua_inputs(&mut self, event_loop: &ActiveEventLoop) {
++        use crate::skua::SkuaInput;
++        use ruffle_core::events::{KeyDescriptor, TextControlCode};
++        use winit::dpi::PhysicalPosition;
++        use winit::event::{ElementState, MouseButton, MouseScrollDelta, TouchPhase};
++
++        let inputs = crate::skua::take_inputs();
++        if inputs.is_empty() {
++            return;
++        }
++        for input in inputs {
++            match input {
++                SkuaInput::Resize { width, height } => {
++                    self.window_event(
++                        event_loop,
++                        WindowEvent::Resized(winit::dpi::PhysicalSize::new(width, height)),
++                    );
++                }
++                SkuaInput::MouseMove { x, y } => {
++                    self.window_event(
++                        event_loop,
++                        WindowEvent::CursorMoved {
++                            device_id: winit::event::DeviceId::dummy(),
++                            position: PhysicalPosition::new(x, y),
++                        },
++                    );
++                }
++                SkuaInput::MouseButton { button, down } => {
++                    let button = match button.as_str() {
++                        "right" => MouseButton::Right,
++                        "middle" => MouseButton::Middle,
++                        _ => MouseButton::Left,
++                    };
++                    let state = if down {
++                        ElementState::Pressed
++                    } else {
++                        ElementState::Released
++                    };
++                    self.window_event(
++                        event_loop,
++                        WindowEvent::MouseInput {
++                            device_id: winit::event::DeviceId::dummy(),
++                            state,
++                            button,
++                        },
++                    );
++                }
++                SkuaInput::MouseWheel { dx, dy } => {
++                    self.window_event(
++                        event_loop,
++                        WindowEvent::MouseWheel {
++                            device_id: winit::event::DeviceId::dummy(),
++                            delta: MouseScrollDelta::PixelDelta(PhysicalPosition::new(dx, dy)),
++                            phase: TouchPhase::Moved,
++                        },
++                    );
++                }
++                SkuaInput::Focus { focused } => {
++                    self.window_event(event_loop, WindowEvent::Focused(focused));
++                }
++                SkuaInput::Visible { visible } => {
++                    let was_occluded = self.occluded;
++                    self.occluded = !visible;
++                    if visible && was_occluded {
++                        self.frame_since_render = true;
++                        self.gui.request_redraw();
++                    }
++                }
++                SkuaInput::Text { text } => {
++                    for codepoint in text.chars() {
++                        self.player
++                            .handle_event(PlayerEvent::TextInput { codepoint });
++                    }
++                    self.check_redraw();
++                }
++                SkuaInput::Key {
++                    down,
++                    code,
++                    key,
++                    ctrl,
++                    shift,
++                    alt: _,
++                } => {
++                    let desc = KeyDescriptor {
++                        physical_key: skua_physical_key(&code),
++                        logical_key: skua_logical_key(&key),
++                        key_location: ruffle_core::events::KeyLocation::Standard,
++                    };
++                    if down {
++                        self.player.handle_event(PlayerEvent::KeyDown { key: desc });
++                        let tc = match (key.as_str(), ctrl, shift) {
++                            ("a" | "A", true, false) => Some(TextControlCode::SelectAll),
++                            ("c" | "C", true, false) => Some(TextControlCode::Copy),
++                            ("v" | "V", true, false) => Some(TextControlCode::Paste),
++                            ("x" | "X", true, false) => Some(TextControlCode::Cut),
++                            ("Enter" | "Return", false, false) => Some(TextControlCode::Enter),
++                            ("Backspace" | "Back", true, _) => Some(TextControlCode::BackspaceWord),
++                            ("Backspace" | "Back", false, _) => Some(TextControlCode::Backspace),
++                            ("Delete", true, _) => Some(TextControlCode::DeleteWord),
++                            ("Delete", false, _) => Some(TextControlCode::Delete),
++                            ("ArrowLeft" | "Left", true, true) => {
++                                Some(TextControlCode::SelectLeftWord)
++                            }
++                            ("ArrowLeft" | "Left", true, false) => {
++                                Some(TextControlCode::MoveLeftWord)
++                            }
++                            ("ArrowLeft" | "Left", false, true) => Some(TextControlCode::SelectLeft),
++                            ("ArrowLeft" | "Left", false, false) => Some(TextControlCode::MoveLeft),
++                            ("ArrowRight" | "Right", true, true) => {
++                                Some(TextControlCode::SelectRightWord)
++                            }
++                            ("ArrowRight" | "Right", true, false) => {
++                                Some(TextControlCode::MoveRightWord)
++                            }
++                            ("ArrowRight" | "Right", false, true) => {
++                                Some(TextControlCode::SelectRight)
++                            }
++                            ("ArrowRight" | "Right", false, false) => {
++                                Some(TextControlCode::MoveRight)
++                            }
++                            ("Home", true, true) => Some(TextControlCode::SelectLeftDocument),
++                            ("Home", true, false) => Some(TextControlCode::MoveLeftDocument),
++                            ("Home", false, true) => Some(TextControlCode::SelectLeftLine),
++                            ("Home", false, false) => Some(TextControlCode::MoveLeftLine),
++                            ("End", true, true) => Some(TextControlCode::SelectRightDocument),
++                            ("End", true, false) => Some(TextControlCode::MoveRightDocument),
++                            ("End", false, true) => Some(TextControlCode::SelectRightLine),
++                            ("End", false, false) => Some(TextControlCode::MoveRightLine),
++                            _ => None,
++                        };
++                        if let Some(code) = tc {
++                            self.player
++                                .handle_event(PlayerEvent::TextControl { code });
++                        }
++                    } else {
++                        self.player.handle_event(PlayerEvent::KeyUp { key: desc });
++                    }
++                    self.check_redraw();
++                }
++                SkuaInput::ClearKeys => {
++                    self.player.handle_event(PlayerEvent::FocusLost);
++                }
++            }
++        }
++    }
++
      fn about_to_wait(&mut self, gilrs: Option<&mut Gilrs>) {
 +        if crate::skua::active() {
 +            crate::skua::rearm();
@@ -139,107 +483,1258 @@ index a5f7bc2..c3cd08a 100644
          if let Some(Event { event, .. }) = gilrs.and_then(|gilrs| gilrs.next_event()) {
              match event {
                  EventType::ButtonPressed(button, _) => {
-@@ -1118,6 +1162,22 @@ impl App {
+@@ -970,7 +1153,7 @@ impl MainWindow {
+             let millihertz = self
+                 .gui
+                 .window()
+-                .current_monitor()
++                .and_then(|w| w.current_monitor())
+                 .and_then(|monitor| monitor.refresh_rate_millihertz())
+                 .unwrap_or(60_000)
+                 .clamp(24_000, 360_000);
+@@ -1036,7 +1219,7 @@ impl MainWindow {
+         let early = self.refresh_interval / 2;
+         let mut due = self.draw_started + early;
+         if now >= due {
+-            self.gui.window().request_redraw();
++            self.gui.request_redraw();
+             due = now + early;
+         }
+         self.next_draw_time = Some(due);
+@@ -1064,11 +1247,105 @@ impl MainWindow {
+             && self.gui.wants_redraws()
+             && (!self.no_gui || self.last_redraw.elapsed() >= Duration::from_millis(16));
+         if player_needs_render || gui_needs_render {
+-            self.gui.window().request_redraw();
++            self.gui.request_redraw();
+         }
      }
  }
  
-+/// Skua build: a borderless child of the given native window (`--skua-parent`).
-+fn skua_child_of(attributes: WindowAttributes, parent: u64) -> WindowAttributes {
-+    use winit::raw_window_handle::RawWindowHandle;
-+    #[cfg(windows)]
-+    let handle = std::num::NonZeroIsize::new(parent as isize)
-+        .map(|hwnd| RawWindowHandle::Win32(winit::raw_window_handle::Win32WindowHandle::new(hwnd)));
-+    #[cfg(all(unix, not(target_os = "macos")))]
-+    let handle = Some(RawWindowHandle::Xlib(winit::raw_window_handle::XlibWindowHandle::new(
-+        parent as _,
-+    )));
-+    #[cfg(target_os = "macos")]
-+    let handle: Option<RawWindowHandle> = None; // ponytail: no embedding on macOS yet, own window
-+    // SAFETY: Bonxie keeps the parent window alive for as long as this player runs.
-+    unsafe { attributes.with_parent_window(handle) }.with_decorations(false)
++fn skua_physical_key(code: &str) -> ruffle_core::events::PhysicalKey {
++    use ruffle_core::events::PhysicalKey as PK;
++    match code {
++        "KeyA" | "A" => PK::KeyA,
++        "KeyB" | "B" => PK::KeyB,
++        "KeyC" | "C" => PK::KeyC,
++        "KeyD" | "D" => PK::KeyD,
++        "KeyE" | "E" => PK::KeyE,
++        "KeyF" | "F" => PK::KeyF,
++        "KeyG" | "G" => PK::KeyG,
++        "KeyH" | "H" => PK::KeyH,
++        "KeyI" | "I" => PK::KeyI,
++        "KeyJ" | "J" => PK::KeyJ,
++        "KeyK" | "K" => PK::KeyK,
++        "KeyL" | "L" => PK::KeyL,
++        "KeyM" | "M" => PK::KeyM,
++        "KeyN" | "N" => PK::KeyN,
++        "KeyO" | "O" => PK::KeyO,
++        "KeyP" | "P" => PK::KeyP,
++        "KeyQ" | "Q" => PK::KeyQ,
++        "KeyR" | "R" => PK::KeyR,
++        "KeyS" | "S" => PK::KeyS,
++        "KeyT" | "T" => PK::KeyT,
++        "KeyU" | "U" => PK::KeyU,
++        "KeyV" | "V" => PK::KeyV,
++        "KeyW" | "W" => PK::KeyW,
++        "KeyX" | "X" => PK::KeyX,
++        "KeyY" | "Y" => PK::KeyY,
++        "KeyZ" | "Z" => PK::KeyZ,
++        "Digit0" | "D0" => PK::Digit0,
++        "Digit1" | "D1" => PK::Digit1,
++        "Digit2" | "D2" => PK::Digit2,
++        "Digit3" | "D3" => PK::Digit3,
++        "Digit4" | "D4" => PK::Digit4,
++        "Digit5" | "D5" => PK::Digit5,
++        "Digit6" | "D6" => PK::Digit6,
++        "Digit7" | "D7" => PK::Digit7,
++        "Digit8" | "D8" => PK::Digit8,
++        "Digit9" | "D9" => PK::Digit9,
++        "Enter" | "Return" => PK::Enter,
++        "Escape" => PK::Escape,
++        "Backspace" | "Back" => PK::Backspace,
++        "Tab" => PK::Tab,
++        "Space" => PK::Space,
++        "ArrowLeft" | "Left" => PK::ArrowLeft,
++        "ArrowRight" | "Right" => PK::ArrowRight,
++        "ArrowUp" | "Up" => PK::ArrowUp,
++        "ArrowDown" | "Down" => PK::ArrowDown,
++        "ShiftLeft" | "LeftShift" => PK::ShiftLeft,
++        "ShiftRight" | "RightShift" => PK::ShiftRight,
++        "ControlLeft" | "LeftCtrl" => PK::ControlLeft,
++        "ControlRight" | "RightCtrl" => PK::ControlRight,
++        "AltLeft" | "LeftAlt" => PK::AltLeft,
++        "AltRight" | "RightAlt" => PK::AltRight,
++        "Delete" => PK::Delete,
++        "Home" => PK::Home,
++        "End" => PK::End,
++        "PageUp" => PK::PageUp,
++        "PageDown" => PK::PageDown,
++        _ => PK::Unknown,
++    }
 +}
 +
- impl ApplicationHandler<RuffleEvent> for App {
-     fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
-         enter_runtime!(self);
-@@ -1147,6 +1207,11 @@ impl ApplicationHandler<RuffleEvent> for App {
++fn skua_logical_key(key: &str) -> ruffle_core::events::LogicalKey {
++    use ruffle_core::events::{LogicalKey as LK, NamedKey as NK};
++    match key {
++        "Enter" | "Return" => LK::Named(NK::Enter),
++        "Escape" => LK::Named(NK::Escape),
++        "Backspace" | "Back" => LK::Named(NK::Backspace),
++        "Tab" => LK::Named(NK::Tab),
++        "Space" | " " => LK::Character(' '),
++        "ArrowLeft" | "Left" => LK::Named(NK::ArrowLeft),
++        "ArrowRight" | "Right" => LK::Named(NK::ArrowRight),
++        "ArrowUp" | "Up" => LK::Named(NK::ArrowUp),
++        "ArrowDown" | "Down" => LK::Named(NK::ArrowDown),
++        "Shift" => LK::Named(NK::Shift),
++        "Control" => LK::Named(NK::Control),
++        "Alt" => LK::Named(NK::Alt),
++        "Delete" => LK::Named(NK::Delete),
++        "Home" => LK::Named(NK::Home),
++        "End" => LK::Named(NK::End),
++        "PageUp" => LK::Named(NK::PageUp),
++        "PageDown" => LK::Named(NK::PageDown),
++        _ => {
++            let mut chars = key.chars();
++            match (chars.next(), chars.next()) {
++                (Some(c), None) => LK::Character(c),
++                _ => LK::Unknown,
++            }
++        }
++    }
++}
++
++
+ pub struct App {
+     main_window: Option<MainWindow>,
+     runtime: Option<tokio::runtime::Runtime>,
+@@ -1147,6 +1444,11 @@ impl ApplicationHandler<RuffleEvent> for App {
                  .with_window_icon(Some(icon))
                  .with_min_inner_size(min_window_size);
  
-+            // Skua build: draw inside Bonxie's game area, which also sizes the window.
-+            if let Some(parent) = self.preferences.cli.skua_parent {
-+                window_attributes = skua_child_of(window_attributes, parent);
++            // Skua build: render offscreen into shared memory for Wayland embedding.
++            if let Some(shm_path) = &self.preferences.cli.skua_shm {
++                crate::skua::init_shm(shm_path.clone());
 +            }
 +
              #[cfg(target_os = "linux")]
              {
                  use winit::platform::startup_notify::{
-@@ -1266,6 +1331,8 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -1165,12 +1469,16 @@ impl ApplicationHandler<RuffleEvent> for App {
+ 
+             let event_loop_proxy = self.event_loop_proxy.clone();
+             let preferences = self.preferences.clone();
+-            let window = event_loop
+-                .create_window(window_attributes)
+-                .expect("Window should be created");
+-            let max_window_size = get_screen_size(&window);
+-            window.set_max_inner_size(Some(max_window_size));
+-            let window = Arc::new(window);
++            let (window, max_window_size) = if crate::skua::shm_active() {
++                (None, PhysicalSize::new(u32::MAX, u32::MAX))
++            } else {
++                let window = event_loop
++                    .create_window(window_attributes)
++                    .expect("Window should be created");
++                let max_window_size = get_screen_size(&window);
++                window.set_max_inner_size(Some(max_window_size));
++                (Some(Arc::new(window)), max_window_size)
++            };
+             let font_database = self.font_database.clone();
+ 
+             let mut gui = GuiController::new(
+@@ -1202,6 +1510,8 @@ impl ApplicationHandler<RuffleEvent> for App {
+ 
+             if movie_url.is_none() {
+                 // No SWF provided on command line; show window with dummy movie immediately.
+-                window.set_visible(true);
++                if let Some(window) = &window {
++                    window.set_visible(true);
++                }
+                 loaded = LoadingState::Loaded;
+             }
+@@ -1266,6 +1571,11 @@ impl ApplicationHandler<RuffleEvent> for App {
                  }
              }
  
-+            (Some(main_window), RuffleEvent::SkuaWake) => main_window.run_skua_calls(),
++            (Some(main_window), RuffleEvent::SkuaWake) => {
++                main_window.run_skua_inputs(event_loop);
++                main_window.run_skua_calls();
++            }
 +
              (Some(main_window), RuffleEvent::MugetsuSetting(setting)) => {
                  main_window.apply_setting(setting);
              }
-@@ -1365,12 +1365,22 @@ impl ApplicationHandler<RuffleEvent> for App {
-     fn window_event(
-         &mut self,
-         event_loop: &ActiveEventLoop,
-         _window_id: WindowId,
-         event: WindowEvent,
-     ) {
-         enter_runtime!(self);
-
-         if let Some(main_window) = &mut self.main_window {
-+            if self.preferences.cli.skua_parent.is_some() {
-+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-+                    main_window.window_event(event_loop, event);
-+                }));
-+                if result.is_err() {
-+                    tracing::warn!("Skua embedded window disappeared while handling an event; exiting");
-+                    event_loop.exit();
+@@ -1297,6 +1607,8 @@ impl ApplicationHandler<RuffleEvent> for App {
+             }
+ 
+             (Some(main_window), RuffleEvent::CloseFile) => {
+-                main_window.gui.window().set_title(&crate::window_title()); // Reset title since file has been closed.
++                if let Some(window) = main_window.gui.window() {
++                    window.set_title(&crate::window_title()); // Reset title since file has been closed.
 +                }
-+            } else {
-             main_window.window_event(event_loop, event);
+                 main_window.gui.close_movie(&mut main_window.player);
+             }
+@@ -1379,7 +1699,17 @@ impl ApplicationHandler<RuffleEvent> for App {
+         enter_runtime!(self);
+ 
+         if let Some(main_window) = &mut self.main_window {
++            if crate::skua::active() {
++                main_window.run_skua_inputs(event_loop);
 +            }
-         }
-     }
-@@ -630,6 +630,10 @@ impl MainWindow {
-                 };
-                 let handled = self.player.handle_event(event);
--                if !handled && state == ElementState::Pressed && button == RuffleMouseButton::Right
-+                // Skua build: always offer Mugetsu's menu from an embedded child. The movie can
-+                // report the right button as handled even though Bonxie still needs this menu.
-+                if (!handled || self.preferences.cli.skua_parent.is_some())
-+                    && state == ElementState::Pressed
-+                    && button == RuffleMouseButton::Right
-                 {
-                     // Show context menu.
-                     if let Some(mut player) = self.player.get() {
+             main_window.about_to_wait(self.gilrs.as_mut());
++            if crate::skua::shm_active() && !main_window.occluded {
++                if crate::skua::take_shm_redraw() {
++                    main_window.render_frame();
++                } else {
++                    main_window.gui.try_flush_shm();
++                }
++            }
+ 
+             // The event loop is finished; let's find out how long we need to wait for.
+             // We don't need to worry about earlier update requests, as it's the
 diff --git a/desktop/src/backends/ui.rs b/desktop/src/backends/ui.rs
+index f928b87d..9c0c53a8 100644
 --- a/desktop/src/backends/ui.rs
 +++ b/desktop/src/backends/ui.rs
-@@ -249,8 +249,13 @@ impl UiBackend for DesktopUiBackend {
+@@ -150,7 +150,7 @@ pub struct DesktopUiBackend {
+     // - https://github.com/emilk/egui/issues/7660
+     // - https://github.com/emilk/egui/issues/7743
+     clipboard: Clipboard,
+-    window: Arc<Window>,
++    window: Option<Arc<Window>>,
+ 
+     event_loop: EventLoopProxy<RuffleEvent>,
+     cursor_visible: bool,
+@@ -170,15 +170,20 @@ pub struct DesktopUiBackend {
+ 
+ impl DesktopUiBackend {
+     pub fn new(
+-        window: Arc<Window>,
++        window: Option<Arc<Window>>,
+         event_loop: EventLoopProxy<RuffleEvent>,
+         font_database: Rc<fontdb::Database>,
+         preferences: GlobalPreferences,
+         file_picker: FilePicker,
+     ) -> Result<Self, Error> {
+         // The window handle is only relevant to linux/wayland
+         // If it fails it'll fallback to x11 or wlr-data-control
+-        let clipboard = Clipboard::new(window.display_handle().ok().map(|handle| handle.as_raw()));
++        let clipboard = Clipboard::new(
++            window
++                .as_ref()
++                .and_then(|w| w.display_handle().ok())
++                .map(|handle| handle.as_raw()),
++        );
+         Ok(Self {
+             window,
+             event_loop,
+@@ -245,10 +250,17 @@ impl UiBackend for DesktopUiBackend {
+     }
+ 
      fn set_fullscreen(&mut self, is_full: bool) -> Result<(), FullscreenError> {
+-        self.window.set_fullscreen(if is_full {
+-            Some(Fullscreen::Borderless(None))
+-        } else {
+-            None
+-        });
 +        // Skua build: the player is an X11 child inside Bonxie. Change Flash's stage state, but
 +        // never ask the child window itself to enter desktop fullscreen.
 +        if crate::skua::active() {
 +            return Ok(());
 +        }
-         self.window.set_fullscreen(if is_full {
-             Some(Fullscreen::Borderless(None))
-         } else {
-             None
-         });
++        if let Some(window) = &self.window {
++            window.set_fullscreen(if is_full {
++                Some(Fullscreen::Borderless(None))
++            } else {
++                None
++            });
++        }
          Ok(())
      }
+diff --git a/desktop/src/cli.rs b/desktop/src/cli.rs
+index aa9f96eb..a3935052 100644
+--- a/desktop/src/cli.rs
++++ b/desktop/src/cli.rs
+@@ -217,6 +217,14 @@ pub struct Opt {
+     #[clap(long)]
+     pub no_gui: bool,
+ 
++    /// Skua build: address (host:port) of Bonxie's bridge, see `skua.rs`.
++    #[clap(long)]
++    pub skua_bridge: Option<String>,
++
++    /// Skua build: shared-memory frame buffer path for offscreen Wayland rendering.
++    #[clap(long)]
++    pub skua_shm: Option<std::path::PathBuf>,
++
+     /// Remaps a specific button on a gamepad to a keyboard key.
+     /// This can be used to add new gamepad support to existing games, for example mapping
+     /// the D-pad to the arrow keys with -B d-pad-up=up -B d-pad-down=down etc.
+diff --git a/desktop/src/custom_event.rs b/desktop/src/custom_event.rs
+index 13be623d..22f8757f 100644
+--- a/desktop/src/custom_event.rs
++++ b/desktop/src/custom_event.rs
+@@ -43,6 +43,9 @@ pub enum RuffleEvent {
+     /// AQW build: the user changed one of Mugetsu's settings (right-click menu).
+     MugetsuSetting(crate::mugetsu::Setting),
+ 
++    /// Skua build: Bonxie sent calls to run (see `skua::take_calls`).
++    SkuaWake,
++
+     /// The movie wants to open a dialog.
+     OpenDialog(DialogDescriptor),
+ 
+diff --git a/desktop/src/gui/context_menu.rs b/desktop/src/gui/context_menu.rs
+index 5708e9ec..24b883c7 100644
+--- a/desktop/src/gui/context_menu.rs
++++ b/desktop/src/gui/context_menu.rs
+@@ -224,7 +224,7 @@ impl ContextMenu {
+                             send(RuffleEvent::MugetsuSetting(Setting::ShowFps(!settings.show_fps)));
+                             item_clicked = true;
+                         }
+-                        if toggle_row(ui, z, "Full screen", "Esc leaves full screen", fullscreen) {
++                        if !crate::skua::active() && toggle_row(ui, z, "Full screen", "Esc leaves full screen", fullscreen) {
+                             send(if fullscreen {
+                                 RuffleEvent::ExitFullScreen
+                             } else {
+diff --git a/desktop/src/gui/controller.rs b/desktop/src/gui/controller.rs
+index fb35b08f..82a6d558 100644
+--- a/desktop/src/gui/controller.rs
++++ b/desktop/src/gui/controller.rs
+@@ -30,17 +30,150 @@ use winit::event_loop::EventLoopProxy;
+ use winit::keyboard::{Key, NamedKey};
+ use winit::window::{ImePurpose as WinitImePurpose, Theme, Window};
+ 
++struct ShmRenderState {
++    target_texture: wgpu::Texture,
++    staging_buffers: [wgpu::Buffer; 2],
++    active_staging: usize,
++    pending_readback: Option<(usize, u32, u32, u32)>,
++    map_status: std::sync::Arc<std::sync::atomic::AtomicU8>,
++    width: u32,
++    height: u32,
++    padded_bytes_per_row: u32,
++    buffer: crate::skua::ShmBuffer,
++}
++
++impl ShmRenderState {
++    fn new(device: &wgpu::Device, width: u32, height: u32) -> anyhow::Result<Self> {
++        let buffer = crate::skua::ShmBuffer::open_from_cli()?;
++        let (target_texture, staging_buffers, padded_bytes_per_row) =
++            Self::create_gpu_resources(device, width, height);
++        Ok(Self {
++            target_texture,
++            staging_buffers,
++            active_staging: 0,
++            pending_readback: None,
++            map_status: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0)),
++            width,
++            height,
++            padded_bytes_per_row,
++            buffer,
++        })
++    }
++
++    fn create_gpu_resources(
++        device: &wgpu::Device,
++        width: u32,
++        height: u32,
++    ) -> (wgpu::Texture, [wgpu::Buffer; 2], u32) {
++        let w = width.max(1);
++        let h = height.max(1);
++        let target_texture = device.create_texture(&wgpu::TextureDescriptor {
++            label: Some("skua shm target"),
++            size: wgpu::Extent3d {
++                width: w,
++                height: h,
++                depth_or_array_layers: 1,
++            },
++            mip_level_count: 1,
++            sample_count: 1,
++            dimension: wgpu::TextureDimension::D2,
++            format: wgpu::TextureFormat::Bgra8Unorm,
++            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
++            view_formats: &[],
++        });
++        let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
++        let unpadded = w * 4;
++        let padded_bytes_per_row = unpadded.div_ceil(align) * align;
++        let buf_desc = wgpu::BufferDescriptor {
++            label: Some("skua shm staging"),
++            size: (padded_bytes_per_row as u64) * (h as u64),
++            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
++            mapped_at_creation: false,
++        };
++        let staging_0 = device.create_buffer(&buf_desc);
++        let staging_1 = device.create_buffer(&buf_desc);
++        (target_texture, [staging_0, staging_1], padded_bytes_per_row)
++    }
++
++    fn begin_readback(&mut self, idx: usize, width: u32, height: u32, padded: u32) {
++        self.map_status.store(0, std::sync::atomic::Ordering::Release);
++        let status = self.map_status.clone();
++        self.staging_buffers[idx].slice(..).map_async(wgpu::MapMode::Read, move |res| {
++            status.store(
++                if res.is_ok() { 1 } else { 2 },
++                std::sync::atomic::Ordering::Release,
++            );
++        });
++        self.pending_readback = Some((idx, width, height, padded));
++    }
++
++    fn try_flush_pending(&mut self, device: &wgpu::Device) {
++        self.poll_readback(device, false);
++    }
++
++    fn flush_pending(&mut self, device: &wgpu::Device) {
++        self.poll_readback(device, true);
++    }
++
++    fn poll_readback(&mut self, device: &wgpu::Device, block: bool) {
++        let Some((idx, width, height, padded)) = self.pending_readback else {
++            return;
++        };
++        let poll_type = if block {
++            wgpu::PollType::wait_indefinitely()
++        } else {
++            wgpu::PollType::Poll
++        };
++        let _ = device.poll(poll_type);
++        let status = self.map_status.load(std::sync::atomic::Ordering::Acquire);
++        if status == 0 {
++            return;
++        }
++        self.pending_readback = None;
++        let staging = &self.staging_buffers[idx];
++        if status == 1 {
++            let slice = staging.slice(..);
++            if let Ok(data) = slice.get_mapped_range() {
++                if let Err(err) = self.buffer.write_frame(width, height, padded, &data) {
++                    tracing::warn!("Skua shm write failed: {err}");
++                }
++                drop(data);
++            }
++            staging.unmap();
++        }
++    }
++
++    fn ensure_size(&mut self, device: &wgpu::Device, width: u32, height: u32) {
++        let w = width.max(1);
++        let h = height.max(1);
++        if self.width != w || self.height != h {
++            self.flush_pending(device);
++            let (tex, bufs, padded) = Self::create_gpu_resources(device, w, h);
++            self.target_texture = tex;
++            self.staging_buffers = bufs;
++            self.active_staging = 0;
++            self.width = w;
++            self.height = h;
++            self.padded_bytes_per_row = padded;
++        }
++    }
++}
++
+ /// Integration layer connecting wgpu+winit to egui.
+ pub struct GuiController {
+     descriptors: Arc<Descriptors>,
+-    egui_winit: egui_winit::State,
++    egui_winit: Option<egui_winit::State>,
++    egui_ctx: Context,
++    pending_egui_events: Vec<egui::Event>,
++    egui_pointer_pos: Option<egui::Pos2>,
+     egui_renderer: egui_wgpu::Renderer,
+     gui: RuffleGui,
+-    window: Arc<Window>,
++    window: Option<Arc<Window>>,
+     last_update: Instant,
+     repaint_after: Duration,
+-    surface: wgpu::Surface<'static>,
++    surface: Option<wgpu::Surface<'static>>,
+     surface_format: wgpu::TextureFormat,
++    shm: Option<ShmRenderState>,
+     movie_view_renderer: Arc<MovieViewRenderer>,
+     // Note that `window.get_inner_size` can change at any point on x11, even between two lines of code.
+     // Use this instead.
+@@ -58,25 +130,32 @@ pub struct GuiController {
+ 
+ impl GuiController {
+     pub fn new(
+-        window: Arc<Window>,
++        window: Option<Arc<Window>>,
+         event_loop: EventLoopProxy<RuffleEvent>,
+         preferences: GlobalPreferences,
+         font_database: &Database,
+         initial_movie_url: Option<Url>,
+         no_gui: bool,
+     ) -> anyhow::Result<Self> {
+         let wanted: wgpu::Backends = preferences.graphics_backends().into();
+         // AQW build: a driver crash from here until shortly after the first frame counts as
+         // the Vulkan driver crashing at startup (see `mugetsu`).
+         crate::mugetsu::vulkan_startup_begin(wanted.contains(wgpu::Backends::VULKAN));
+-        let (instance, backend) = select_wgpu_backend(wanted, &window)?;
++        let (instance, backend) = select_wgpu_backend(wanted, window.as_ref())?;
+         #[cfg(windows)]
+         crate::windows::test_native_crash();
+-        let surface = instance.create_surface(window.clone())?;
++        let shm_mode = crate::skua::shm_active();
++        let surface = if shm_mode {
++            None
++        } else if let Some(window) = &window {
++            Some(instance.create_surface(window.clone())?)
++        } else {
++            None
++        };
+         let (adapter, device, queue) = futures::executor::block_on(request_adapter_and_device(
+             backend,
+             &instance,
+-            Some(&surface),
++            surface.as_ref(),
+             preferences.graphics_power_preference().into(),
+         ))
+         .map_err(|e| anyhow!(e.to_string()))?;
+@@ -100,50 +178,63 @@ impl GuiController {
+         );
+         if wanted.contains(wgpu::Backends::VULKAN) && adapter_info.backend != wgpu::Backend::Vulkan
+         {
+-            aqw_warn_vulkan_fallback(&preferences, adapter_info.backend, &window);
++            if let Some(window) = &window {
++                aqw_warn_vulkan_fallback(&preferences, adapter_info.backend, window);
++            }
+         }
+         crate::mugetsu::check_gpu_choice(
+             window.clone(),
+             &adapter_info,
+             preferences.graphics_power_preference().into(),
+         );
+-        crate::mugetsu::spawn_update_check(window.clone());
+         #[cfg(windows)]
+         if crate::mugetsu::plays_aqw() {
+-            crate::windows::add_graphics_menu(&window);
++            if let Some(window) = &window {
++                crate::windows::add_graphics_menu(window);
++            }
+         }
+-        let preferred_formats = [
+-            // by egui
+-            wgpu::TextureFormat::Rgba8Unorm,
+-            wgpu::TextureFormat::Bgra8Unorm,
+-        ];
+-        let supported_formats = surface.get_capabilities(&adapter).formats;
+-        let surface_format = preferred_formats
+-            .iter()
+-            .find(|format| supported_formats.contains(format))
+-            .copied()
+-            .unwrap_or_else(|| {
+-                supported_formats
+-                    .first()
+-                    .copied()
+-                    .expect("At least one format should be supported")
+-            });
+-        tracing::info!("Using surface format {:?}", surface_format);
+-        let size = window.inner_size();
+-        surface.configure(
+-            &device,
+-            &wgpu::SurfaceConfiguration {
+-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+-                format: surface_format,
+-                color_space: wgpu::SurfaceColorSpace::Auto,
+-                width: size.width,
+-                height: size.height,
+-                present_mode: Default::default(),
+-                desired_maximum_frame_latency: 2,
+-                alpha_mode: Default::default(),
+-                view_formats: Default::default(),
+-            },
+-        );
++        let (surface_format, size, shm) = if let Some(surface) = &surface {
++            let preferred_formats = [
++                // by egui
++                wgpu::TextureFormat::Rgba8Unorm,
++                wgpu::TextureFormat::Bgra8Unorm,
++            ];
++            let supported_formats = surface.get_capabilities(&adapter).formats;
++            let surface_format = preferred_formats
++                .iter()
++                .find(|format| supported_formats.contains(format))
++                .copied()
++                .unwrap_or_else(|| {
++                    supported_formats
++                        .first()
++                        .copied()
++                        .expect("At least one format should be supported")
++                });
++            tracing::info!("Using surface format {:?}", surface_format);
++            let size = window
++                .as_ref()
++                .expect("surface requires a window")
++                .inner_size();
++            surface.configure(
++                &device,
++                &wgpu::SurfaceConfiguration {
++                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
++                    format: surface_format,
++                    color_space: wgpu::SurfaceColorSpace::Auto,
++                    width: size.width,
++                    height: size.height,
++                    present_mode: Default::default(),
++                    desired_maximum_frame_latency: 2,
++                    alpha_mode: Default::default(),
++                    view_formats: Default::default(),
++                },
++            );
++            (surface_format, size, None)
++        } else {
++            let size = PhysicalSize::new(960, 550);
++            let shm = ShmRenderState::new(&device, size.width, size.height)?;
++            (wgpu::TextureFormat::Bgra8Unorm, size, Some(shm))
++        };
+         let descriptors = Descriptors::new(instance, adapter, device, queue);
+         let egui_ctx = Context::default();
+ 
+@@ -152,86 +240,118 @@ impl GuiController {
+         let theme_controller = futures::executor::block_on(ThemeController::new(
+             window.clone(),
+             preferences.clone(),
+             egui_ctx.clone(),
+         ));
+-        let mut egui_winit = egui_winit::State::new(
+-            egui_ctx,
+-            ViewportId::ROOT,
+-            window.as_ref(),
+-            None,
+-            None,
+-            None,
+-        );
+-        egui_winit.set_max_texture_side(descriptors.limits.max_texture_dimension_2d as usize);
++        let egui_winit = window.as_ref().map(|w| {
++            let mut state = egui_winit::State::new(
++                egui_ctx.clone(),
++                ViewportId::ROOT,
++                w.as_ref(),
++                None,
++                None,
++                None,
++            );
++            state.set_max_texture_side(descriptors.limits.max_texture_dimension_2d as usize);
++            state
++        });
+ 
++        let scale_factor = if shm_mode {
++            1.0
++        } else {
++            window.as_ref().map_or(1.0, |w| w.scale_factor())
++        };
+         let movie_view_renderer = Arc::new(MovieViewRenderer::new(
+             &descriptors.device,
+             surface_format,
+-            window.fullscreen().is_none() && !no_gui,
++            !shm_mode && window.as_ref().is_some_and(|w| w.fullscreen().is_none()) && !no_gui,
+             size.height,
+-            window.scale_factor(),
++            scale_factor,
+         ));
+         let egui_renderer = egui_wgpu::Renderer::new(
+             &descriptors.device,
+             surface_format,
+             egui_wgpu::RendererOptions {
+                 msaa_samples: 1,
+                 depth_stencil_format: None,
+                 dithering: false,
+                 predictable_texture_filtering: false,
+             },
+         );
+         let descriptors = Arc::new(descriptors);
+         let gui = RuffleGui::new(
+-            Arc::downgrade(&window),
++            window.as_ref().map(Arc::downgrade).unwrap_or_default(),
+             event_loop,
+             initial_movie_url.map(|url| ContentDescriptor {
+                 url,
+                 root_content_path: None,
+             }),
+             LaunchOptions::from(&preferences),
+             preferences.clone(),
+         );
+         let system_fonts = load_system_fonts(font_database, preferences.language());
+-        egui_winit.egui_ctx().set_fonts(system_fonts);
++        egui_ctx.set_fonts(system_fonts);
+ 
+-        egui_extras::install_image_loaders(egui_winit.egui_ctx());
++        egui_extras::install_image_loaders(&egui_ctx);
+ 
+         #[cfg(feature = "tracy_images")]
+         let tracy_frame_captures = crate::tracy::FrameCapturesHolder::new(&descriptors.device);
+ 
+         Ok(Self {
+             descriptors,
+             egui_winit,
++            egui_ctx,
++            pending_egui_events: Vec::new(),
++            egui_pointer_pos: None,
+             egui_renderer,
+             gui,
+             window,
+             last_update: Instant::now(),
+             repaint_after: Duration::ZERO,
+             surface,
+             surface_format,
++            shm,
+             movie_view_renderer,
+             size,
+             no_gui,
+             ui_visible: true,
+             theme_controller,
+             #[cfg(feature = "tracy_images")]
+             tracy_frame_captures,
+         })
+     }
+ 
+     pub fn set_theme(&self, theme: Theme) {
+         self.theme_controller.set_theme(theme);
+     }
+ 
+     pub fn descriptors(&self) -> &Arc<Descriptors> {
+         &self.descriptors
+     }
+ 
+     pub fn file_picker(&self) -> FilePicker {
+         self.gui.dialogs.file_picker()
+     }
+ 
+-    pub fn window(&self) -> &Arc<Window> {
+-        &self.window
++    pub fn window(&self) -> Option<&Arc<Window>> {
++        self.window.as_ref()
++    }
++
++    pub fn request_redraw(&self) {
++        if self.shm.is_some() {
++            crate::skua::request_shm_redraw();
++        } else if let Some(window) = &self.window {
++            window.request_redraw();
++        }
++    }
++
++    pub fn flush_shm(&mut self) {
++        if let Some(shm) = &mut self.shm {
++            shm.flush_pending(&self.descriptors.device);
++        }
++    }
++
++    pub fn try_flush_shm(&mut self) {
++        if let Some(shm) = &mut self.shm {
++            shm.try_flush_pending(&self.descriptors.device);
++        }
+     }
+@@ -241,25 +326,28 @@ impl GuiController {
+     }
+ 
+     pub fn reconfigure_surface(&self) {
+-        self.surface.configure(
+-            &self.descriptors.device,
+-            &wgpu::SurfaceConfiguration {
+-                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+-                format: self.surface_format,
+-                color_space: wgpu::SurfaceColorSpace::Auto,
+-                width: self.size.width,
+-                height: self.size.height,
+-                present_mode: Default::default(),
+-                desired_maximum_frame_latency: 2,
+-                alpha_mode: Default::default(),
+-                view_formats: Default::default(),
+-            },
+-        );
++        if let Some(surface) = &self.surface {
++            surface.configure(
++                &self.descriptors.device,
++                &wgpu::SurfaceConfiguration {
++                    usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
++                    format: self.surface_format,
++                    color_space: wgpu::SurfaceColorSpace::Auto,
++                    width: self.size.width,
++                    height: self.size.height,
++                    present_mode: Default::default(),
++                    desired_maximum_frame_latency: 2,
++                    alpha_mode: Default::default(),
++                    view_formats: Default::default(),
++                },
++            );
++        }
++        let shm_mode = self.shm.is_some();
+         self.movie_view_renderer.update_resolution(
+             &self.descriptors,
+-            self.window.fullscreen().is_none() && !self.no_gui,
++            !shm_mode && self.window.as_ref().is_some_and(|w| w.fullscreen().is_none()) && !self.no_gui,
+             self.size.height,
+-            self.window.scale_factor(),
++            if shm_mode { 1.0 } else { self.window.as_ref().map_or(1.0, |w| w.scale_factor()) },
+         );
+     }
+ 
+@@ -290,10 +378,62 @@ impl GuiController {
+-        let response = self.egui_winit.on_window_event(&self.window, event);
++        let (response_repaint, response_consumed) = if let (Some(egui_winit), Some(window)) =
++            (&mut self.egui_winit, &self.window)
++        {
++            let response = egui_winit.on_window_event(window, event);
++            (response.repaint, response.consumed)
++        } else {
++            match event {
++                WindowEvent::CursorMoved { position, .. } => {
++                    let pos = egui::pos2(position.x as f32, position.y as f32);
++                    self.egui_pointer_pos = Some(pos);
++                    self.pending_egui_events.push(egui::Event::PointerMoved(pos));
++                }
++                WindowEvent::MouseInput { state, button, .. } => {
++                    let btn = match button {
++                        winit::event::MouseButton::Left => Some(egui::PointerButton::Primary),
++                        winit::event::MouseButton::Right => Some(egui::PointerButton::Secondary),
++                        winit::event::MouseButton::Middle => Some(egui::PointerButton::Middle),
++                        _ => None,
++                    };
++                    if let Some(button) = btn {
++                        let pos = self.egui_pointer_pos.unwrap_or_default();
++                        self.pending_egui_events.push(egui::Event::PointerButton {
++                            pos,
++                            button,
++                            pressed: *state == winit::event::ElementState::Pressed,
++                            modifiers: egui::Modifiers::NONE,
++                        });
++                    }
++                }
++                WindowEvent::MouseWheel { delta, .. } => {
++                    let (unit, delta) = match delta {
++                        winit::event::MouseScrollDelta::LineDelta(x, y) => {
++                            (egui::MouseWheelUnit::Line, egui::vec2(*x, *y))
++                        }
++                        winit::event::MouseScrollDelta::PixelDelta(pos) => {
++                            (egui::MouseWheelUnit::Point, egui::vec2(pos.x as f32, pos.y as f32))
++                        }
++                    };
++                    self.pending_egui_events.push(egui::Event::MouseWheel {
++                        unit,
++                        delta,
++                        phase: egui::TouchPhase::Move,
++                        modifiers: egui::Modifiers::NONE,
++                    });
++                }
++                WindowEvent::CursorLeft { .. } | WindowEvent::Focused(false) => {
++                    self.egui_pointer_pos = None;
++                    self.pending_egui_events.push(egui::Event::PointerGone);
++                }
++                _ => {}
++            }
++            (self.wants_redraws(), self.egui_ctx.egui_wants_pointer_input())
++        };
+         // AQW build: egui asks for a repaint on every mouse move. When it shows nothing, the
+         // repaint would only present the movie's last frame again (extra presents that frame
+         // counters and frame generation tools such as Lossless Scaling count as frames); the
+         // input still reaches egui with the next movie frame.
+-        if response.repaint && self.wants_redraws() {
+-            self.window.request_redraw();
++        if response_repaint && self.wants_redraws() {
++            self.request_redraw();
+         }
+-        response.consumed
++        response_consumed
+     }
+@@ -331,8 +423,8 @@ impl GuiController {
+     }
+ 
+     pub fn height_offset(&self) -> f64 {
+-        if self.window.fullscreen().is_some() || self.no_gui {
++        if self.shm.is_some() || self.window.as_ref().is_none_or(|w| w.fullscreen().is_some()) || self.no_gui {
+             0.0
+         } else {
+-            MENU_HEIGHT as f64 * self.window.scale_factor()
++            MENU_HEIGHT as f64 * self.window.as_ref().map_or(1.0, |w| w.scale_factor())
+         }
+@@ -350,50 +442,38 @@ impl GuiController {
+     }
+ 
+     pub fn render(&mut self, mut player: Option<MutexGuard<Player>>) {
+-        let surface_texture = match self.surface.get_current_texture() {
+-            wgpu::CurrentSurfaceTexture::Success(surface_texture) => surface_texture,
+-            wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => {
+-                // The acquired texture is still usable - no reason to waste
+-                // this frame. The surface should ideally be reconfigured
+-                // before the next acquire; usually a resize event arrives and
+-                // does that, but not always (e.g. on a display transform
+-                // change) - we accept staying suboptimal in that case for now.
+-                surface_texture
++        let shm_mode = self.shm.is_some();
++        let surface_texture = if let Some(surface) = &self.surface {
++            match surface.get_current_texture() {
++                wgpu::CurrentSurfaceTexture::Success(surface_texture) => Some(surface_texture),
++                wgpu::CurrentSurfaceTexture::Suboptimal(surface_texture) => Some(surface_texture),
++                state @ (wgpu::CurrentSurfaceTexture::Lost
++                | wgpu::CurrentSurfaceTexture::Outdated) => {
++                    if crate::skua::active() && matches!(state, wgpu::CurrentSurfaceTexture::Lost) {
++                        tracing::info!("Skua surface lost (host window closed), exiting");
++                        std::process::exit(0);
++                    }
++                    tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
++                    self.reconfigure_surface();
++                    return;
++                }
++                wgpu::CurrentSurfaceTexture::Timeout => {
++                    tracing::warn!("Surface acquisition timed out, skipping a frame");
++                    return;
++                }
++                wgpu::CurrentSurfaceTexture::Occluded => {
++                    tracing::trace!("Surface is occluded, skipping a frame");
++                    return;
++                }
++                wgpu::CurrentSurfaceTexture::Validation => {
++                    panic!("wgpu: Acquiring a texture failed with a validation error");
++                }
+             }
+-            state @ (wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated) => {
+-                // Reconfigure the surface if lost or outdated.
+-                // Some sources suggest ignoring `Outdated` and waiting for the next frame,
+-                // but I suspect this advice is related explicitly to resizing,
+-                // because the future resize event will reconfigure the surface.
+-                // However, resizing is not the only possible reason for the surface
+-                // to become outdated (resolution / refresh rate change, some internal
+-                // platform-specific reasons, wgpu bugs?).
+-                // Testing on Vulkan shows that reconfiguring the surface works in that case.
+-                tracing::warn!("Surface became unavailable: {:?}, reconfiguring", state);
+-                self.reconfigure_surface();
+-                return;
+-            }
+-            wgpu::CurrentSurfaceTexture::Timeout => {
+-                // Acquiring the frame took too long (a full second, as of wgpu 29).
+-                // The best thing we can do is skip a frame and wait.
+-                tracing::warn!("Surface acquisition timed out, skipping a frame");
+-                return;
+-            }
+-            wgpu::CurrentSurfaceTexture::Occluded => {
+-                // The window is occluded (e.g. minimized or fully covered by
+-                // another window), so there is no point in drawing anything.
+-                // We normally don't even get here, as `WindowEvent::Occluded`
+-                // makes us skip rendering entirely - but the two can race, and
+-                // not every platform reports occlusion through winit.
+-                // Unlike `Timeout`, this returns immediately, so it would repeat
+-                // at the movie's frame rate: keep it quiet, it's not an error.
+-                tracing::trace!("Surface is occluded, skipping a frame");
+-                return;
+-            }
+-            wgpu::CurrentSurfaceTexture::Validation => {
+-                // Generic error, not much we can do.
+-                panic!("wgpu: Acquiring a texture failed with a validation error");
++        } else {
++            if let Some(shm) = &mut self.shm {
++                shm.ensure_size(&self.descriptors.device, self.size.width, self.size.height);
+             }
++            None
+         };
+ 
+         #[cfg(feature = "tracy_images")]
+@@ -402,53 +482,70 @@ impl GuiController {
+                 .set_target(&self.descriptors.device, None);
+         }
+ 
+-        let raw_input = self.egui_winit.take_egui_input(&self.window);
+-        let show_menu = self.window.fullscreen().is_none() && !self.no_gui;
++        let scale_factor = if shm_mode {
++            1.0
++        } else {
++            self.window.as_ref().map_or(1.0, |w| w.scale_factor() as f32)
++        };
++        let mut raw_input = if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
++            egui_winit.take_egui_input(window)
++        } else {
++            egui::RawInput {
++                events: std::mem::take(&mut self.pending_egui_events),
++                ..Default::default()
++            }
++        };
++        if shm_mode {
++            raw_input.screen_rect = Some(egui::Rect::from_min_size(
++                egui::Pos2::ZERO,
++                egui::vec2(self.size.width as f32, self.size.height as f32),
++            ));
++        }
++        let show_menu = !shm_mode && self.window.as_ref().is_some_and(|w| w.fullscreen().is_none()) && !self.no_gui;
+         let mut counter_shapes = 0;
+         let counter_top = self.height_offset();
+-        let mut full_output = self.egui_winit.egui_ctx().run_ui(raw_input, |ui| {
++        let mut full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+             self.gui.update(
+-                self.egui_winit.egui_ctx(),
++                &self.egui_ctx,
+                 ui,
+                 show_menu,
+                 player.as_deref_mut(),
+                 if show_menu {
+-                    MENU_HEIGHT as f64 * self.window.scale_factor()
++                    MENU_HEIGHT as f64 * self.window.as_ref().map_or(1.0, |w| w.scale_factor())
+                 } else {
+                     0.0
+                 },
+             );
+             if crate::mugetsu::show_fps() {
+                 counter_shapes = fps_counter(ui.ctx(), counter_top);
+             }
+         });
+         // AQW build: the FPS counter (Mugetsu's settings) is redrawn with the movie's frames
+         // only, so on its own it isn't UI that wants repaints (see `wants_redraws`).
+         self.ui_visible = full_output.shapes.len() > counter_shapes;
+         self.repaint_after = full_output
+             .viewport_output
+             .get(&ViewportId::ROOT)
+             .expect("Root viewport must exist")
+             .repaint_delay;
+ 
+         // If we're not in a UI, tell egui which cursor we prefer to use instead
+-        if !self.egui_winit.egui_ctx().egui_wants_pointer_input()
++        if !self.egui_ctx.egui_wants_pointer_input()
+             && let Some(player) = player.as_deref()
+         {
+             full_output.platform_output.cursor_icon =
+                 <dyn Any>::downcast_ref::<DesktopUiBackend>(player.ui())
+                     .unwrap_or_else(|| panic!("UI Backend should be DesktopUiBackend"))
+                     .cursor();
+         }
+-        self.egui_winit
+-            .handle_platform_output(&self.window, full_output.platform_output);
++        if let (Some(egui_winit), Some(window)) = (&mut self.egui_winit, &self.window) {
++            egui_winit.handle_platform_output(window, full_output.platform_output);
++        }
+ 
+-        let clipped_primitives = self
+-            .egui_winit
+-            .egui_ctx()
++        let clipped_primitives = self
++            .egui_ctx
+             .tessellate(full_output.shapes, full_output.pixels_per_point);
+ 
+-        let scale_factor = self.window.scale_factor() as f32;
+         let screen_descriptor = egui_wgpu::ScreenDescriptor {
+             size_in_pixels: [self.size.width, self.size.height],
+             pixels_per_point: scale_factor,
+@@ -490,7 +580,12 @@ impl GuiController {
+         };
+ 
+         {
+-            let surface_view = surface_texture.texture.create_view(&Default::default());
++            let target_texture = surface_texture
++                .as_ref()
++                .map(|s| &s.texture)
++                .or_else(|| self.shm.as_ref().map(|s| &s.target_texture))
++                .expect("render target must exist");
++            let surface_view = target_texture.create_view(&Default::default());
+ 
+             let mut render_pass = encoder
+                 .begin_render_pass(&wgpu::RenderPassDescriptor {
+@@ -523,6 +618,30 @@ impl GuiController {
+             }
+         }
+ 
++        if let Some(shm) = &self.shm {
++            encoder.copy_texture_to_buffer(
++                wgpu::TexelCopyTextureInfo {
++                    texture: &shm.target_texture,
++                    mip_level: 0,
++                    origin: wgpu::Origin3d::ZERO,
++                    aspect: wgpu::TextureAspect::All,
++                },
++                wgpu::TexelCopyBufferInfo {
++                    buffer: &shm.staging_buffers[shm.active_staging],
++                    layout: wgpu::TexelCopyBufferLayout {
++                        offset: 0,
++                        bytes_per_row: Some(shm.padded_bytes_per_row),
++                        rows_per_image: Some(shm.height),
++                    },
++                },
++                wgpu::Extent3d {
++                    width: shm.width,
++                    height: shm.height,
++                    depth_or_array_layers: 1,
++                },
++            );
++        }
++
+         command_buffers.push(encoder.finish());
+         self.descriptors.queue.submit(command_buffers);
+ 
+@@ -533,8 +652,20 @@ impl GuiController {
+             self.egui_renderer.free_texture(&id);
+         }
+ 
+-        self.window.pre_present_notify();
+-        self.descriptors.queue.present(surface_texture);
++        if let Some(surface_texture) = surface_texture {
++            if let Some(window) = &self.window {
++                window.pre_present_notify();
++            }
++            self.descriptors.queue.present(surface_texture);
++        } else if let Some(shm) = &mut self.shm {
++            let cur = shm.active_staging;
++            let w = shm.width;
++            let h = shm.height;
++            let padded = shm.padded_bytes_per_row;
++            shm.flush_pending(&self.descriptors.device);
++            shm.begin_readback(cur, w, h, padded);
++            shm.active_staging = 1 - cur;
++        }
+         crate::mugetsu::frame_presented();
+         #[cfg(feature = "tracy")]
+         tracing_tracy::client::frame_mark();
+@@ -548,15 +689,21 @@ impl GuiController {
+         settings: Option<crate::mugetsu::MenuSettings>,
+         close_event: PlayerEvent,
+     ) {
+         self.gui.show_context_menu(menu, settings, close_event);
+-        self.window.request_redraw();
++        self.request_redraw();
+     }
+ 
+     pub fn is_context_menu_visible(&self) -> bool {
+         self.gui.is_context_menu_visible()
+     }
+ 
++    pub fn is_open_url_dialog_visible(&self) -> bool {
++        self.gui.dialogs.is_open_url_dialog_visible()
++    }
++
+     /// AQW build: whether GUI-only repaints are useful: egui shows something, or is about to.
+     pub fn wants_redraws(&self) -> bool {
+-        self.ui_visible || self.gui.is_context_menu_visible()
++        self.ui_visible
++            || self.gui.is_context_menu_visible()
++            || self.gui.dialogs.is_open_url_dialog_visible()
+     }
+@@ -571,22 +712,28 @@ impl GuiController {
+     pub fn open_dialog(&mut self, dialog_event: DialogDescriptor) {
+         self.gui.dialogs.open_dialog(dialog_event);
+-        self.window.request_redraw();
++        self.request_redraw();
+     }
+ 
+     pub fn set_ime_allowed(&self, allowed: bool) {
+-        self.window.set_ime_allowed(allowed);
++        if let Some(window) = &self.window {
++            window.set_ime_allowed(allowed);
++        }
+     }
+ 
+     pub fn set_ime_purpose(&self, purpose: ImePurpose) {
+-        self.window.set_ime_purpose(match purpose {
+-            ImePurpose::Standard => WinitImePurpose::Normal,
+-            ImePurpose::Password => WinitImePurpose::Password,
+-        });
++        if let Some(window) = &self.window {
++            window.set_ime_purpose(match purpose {
++                ImePurpose::Standard => WinitImePurpose::Normal,
++                ImePurpose::Password => WinitImePurpose::Password,
++            });
++        }
+     }
+ 
+     pub fn set_ime_cursor_area(&self, cursor_area: ImeCursorArea) {
+-        self.window.set_ime_cursor_area(
+-            self.movie_to_window_position(cursor_area.x, cursor_area.y),
+-            PhysicalSize::new(cursor_area.width, cursor_area.height),
+-        );
++        if let Some(window) = &self.window {
++            window.set_ime_cursor_area(
++                self.movie_to_window_position(cursor_area.x, cursor_area.y),
++                PhysicalSize::new(cursor_area.width, cursor_area.height),
++            );
++        }
+     }
+@@ -612,9 +759,9 @@ impl GuiController {
+ fn select_wgpu_backend(
+     preferred_backends: wgpu::Backends,
+-    window: &Arc<Window>,
++    window: Option<&Arc<Window>>,
+ ) -> anyhow::Result<(wgpu::Instance, wgpu::Backends)> {
+     for backend in preferred_backends.iter() {
+-        if let Some(instance) = try_wgpu_backend(backend, window.clone()) {
++        if let Some(instance) = try_wgpu_backend(backend, window.cloned()) {
+             tracing::info!(
+                 "Using preferred backend {}",
+                 format_list(&get_backend_names(backend), "and")
+@@ -638,5 +785,5 @@ fn select_wgpu_backend(
+     for backend in ordered {
+-        if let Some(instance) = try_wgpu_backend(backend, window.clone()) {
++        if let Some(instance) = try_wgpu_backend(backend, window.cloned()) {
+             tracing::info!(
+                 "Using fallback backend {}",
+                 format_list(&get_backend_names(backend), "and")
+@@ -653,6 +800,6 @@ fn select_wgpu_backend(
+-fn try_wgpu_backend(backend: wgpu::Backends, window: Arc<Window>) -> Option<wgpu::Instance> {
++fn try_wgpu_backend(backend: wgpu::Backends, window: Option<Arc<Window>>) -> Option<wgpu::Instance> {
+     let instance = create_wgpu_instance(
+         backend,
+         wgpu::BackendOptions::default(),
+-        Some(Box::new(window)),
++        window.map(|w| Box::new(w) as _),
+     );
+diff --git a/desktop/src/gui/dialogs.rs b/desktop/src/gui/dialogs.rs
+index c6cbf232..849cd8cd 100644
+--- a/desktop/src/gui/dialogs.rs
++++ b/desktop/src/gui/dialogs.rs
+@@ -182,6 +182,10 @@ impl Dialogs {
+         self.open_dialog.options()
+     }
+ 
++    pub fn is_open_url_dialog_visible(&self) -> bool {
++        self.open_url_dialog.is_some()
++    }
++
+     pub fn open_dialog(&mut self, event: DialogDescriptor) {
+         match event {
+             DialogDescriptor::OpenUrl(url) => {
+diff --git a/desktop/src/gui/menu_bar.rs b/desktop/src/gui/menu_bar.rs
+--- a/desktop/src/gui/menu_bar.rs
++++ b/desktop/src/gui/menu_bar.rs
+index 206651f5..eb73700d 100644
+--- a/desktop/src/gui/menu_bar.rs
++++ b/desktop/src/gui/menu_bar.rs
+@@ -75,9 +75,9 @@ impl MenuBar {
+             }
+         }
+ 
+-        let mut fullscreen_pressed =
+-            egui_ctx.input_mut(|input| input.consume_shortcut(&Self::SHORTCUT_FULLSCREEN));
+-        if cfg!(windows) && !fullscreen_pressed {
++        let mut fullscreen_pressed = !crate::skua::active()
++            && egui_ctx.input_mut(|input| input.consume_shortcut(&Self::SHORTCUT_FULLSCREEN));
++        if cfg!(windows) && !crate::skua::active() && !fullscreen_pressed {
+             // TODO We can remove this shortcut when we add some kind of preferences.
+             fullscreen_pressed = egui_ctx
+                 .input_mut(|input| input.consume_shortcut(&Self::SHORTCUT_FULLSCREEN_WINDOWS));
+diff --git a/desktop/src/gui/theme.rs b/desktop/src/gui/theme.rs
+--- a/desktop/src/gui/theme.rs
++++ b/desktop/src/gui/theme.rs
+@@ -22,12 +22,12 @@ pub struct ThemeController(Arc<Mutex<ThemeControllerData>>);
+ 
+ impl ThemeController {
+     pub async fn new(
+-        window: Arc<Window>,
++        window: Option<Arc<Window>>,
+         preferences: GlobalPreferences,
+         egui_ctx: Context,
+     ) -> Self {
+         let this = Self(Arc::new(Mutex::new(ThemeControllerData {
+-            window: Arc::downgrade(&window),
++            window: window.as_ref().map(Arc::downgrade).unwrap_or_default(),
+             egui_ctx,
+             theme_preference: Default::default(), // Will be set later
+             #[cfg(target_os = "linux")]
 diff --git a/desktop/src/linux.rs b/desktop/src/linux.rs
+index d9b2c51f..5ec83c8b 100644
 --- a/desktop/src/linux.rs
 +++ b/desktop/src/linux.rs
-@@ -15,22 +15,35 @@
- pub fn choose_graphics(_window: &winit::window::Window, choice: Option<Graphics>) {
+@@ -12,24 +12,37 @@ pub fn start_again() {
+         .spawn();
+ }
+ 
+-pub fn choose_graphics(_window: &winit::window::Window, choice: Option<Graphics>) {
++pub fn choose_graphics(_window: Option<&winit::window::Window>, choice: Option<Graphics>) {
      if choice == mugetsu::saved_graphics() {
          return;
      }
@@ -277,127 +1772,8 @@ diff --git a/desktop/src/linux.rs b/desktop/src/linux.rs
      tracing::info!("Graphics changed to {name}; starting Mugetsu again");
      start_again();
      std::process::exit(0);
- }
-diff --git a/desktop/src/gui/context_menu.rs b/desktop/src/gui/context_menu.rs
---- a/desktop/src/gui/context_menu.rs
-+++ b/desktop/src/gui/context_menu.rs
-@@ -224,11 +224,11 @@
-                             send(RuffleEvent::MugetsuSetting(Setting::ShowFps(!settings.show_fps)));
-                             item_clicked = true;
-                         }
--                        if toggle_row(ui, z, "Full screen", "Esc leaves full screen", fullscreen) {
-+                        if !crate::skua::active() && toggle_row(ui, z, "Full screen", "Esc leaves full screen", fullscreen) {
-                             send(if fullscreen {
-                                 RuffleEvent::ExitFullScreen
-                             } else {
-                                 RuffleEvent::EnterFullScreen
-                             });
-                             item_clicked = true;
-                         }
-diff --git a/desktop/src/gui/menu_bar.rs b/desktop/src/gui/menu_bar.rs
---- a/desktop/src/gui/menu_bar.rs
-+++ b/desktop/src/gui/menu_bar.rs
-@@ -78,13 +78,13 @@
--        let mut fullscreen_pressed =
--            egui_ctx.input_mut(|input| input.consume_shortcut(&Self::SHORTCUT_FULLSCREEN));
--        if cfg!(windows) && !fullscreen_pressed {
-+        let mut fullscreen_pressed = !crate::skua::active()
-+            && egui_ctx.input_mut(|input| input.consume_shortcut(&Self::SHORTCUT_FULLSCREEN));
-+        if cfg!(windows) && !crate::skua::active() && !fullscreen_pressed {
-             // TODO We can remove this shortcut when we add some kind of preferences.
-             fullscreen_pressed = egui_ctx
-                 .input_mut(|input| input.consume_shortcut(&Self::SHORTCUT_FULLSCREEN_WINDOWS));
-         }
-         if let Some(player) = &mut player
-             && fullscreen_pressed
-         {
-             let is_fullscreen = player.is_fullscreen();
-             player.set_fullscreen(!is_fullscreen);
-         }
-diff --git a/desktop/src/cli.rs b/desktop/src/cli.rs
-index aa9f96e..8c4f1c3 100644
---- a/desktop/src/cli.rs
-+++ b/desktop/src/cli.rs
-@@ -217,6 +217,14 @@ pub struct Opt {
-     #[clap(long)]
-     pub no_gui: bool,
- 
-+    /// Skua build: address (host:port) of Bonxie's bridge, see `skua.rs`.
-+    #[clap(long)]
-+    pub skua_bridge: Option<String>,
-+
-+    /// Skua build: native handle of the window to draw in, as a child window.
-+    #[clap(long)]
-+    pub skua_parent: Option<u64>,
-+
-     /// Remaps a specific button on a gamepad to a keyboard key.
-     /// This can be used to add new gamepad support to existing games, for example mapping
-     /// the D-pad to the arrow keys with -B d-pad-up=up -B d-pad-down=down etc.
-diff --git a/desktop/src/custom_event.rs b/desktop/src/custom_event.rs
-index 13be623..22f8757 100644
---- a/desktop/src/custom_event.rs
-+++ b/desktop/src/custom_event.rs
-@@ -43,6 +43,9 @@ pub enum RuffleEvent {
-     /// AQW build: the user changed one of Mugetsu's settings (right-click menu).
-     MugetsuSetting(crate::mugetsu::Setting),
- 
-+    /// Skua build: Bonxie sent calls to run (see `skua::take_calls`).
-+    SkuaWake,
-+
-     /// The movie wants to open a dialog.
-     OpenDialog(DialogDescriptor),
- 
-diff --git a/desktop/src/gui/controller.rs b/desktop/src/gui/controller.rs
-index fb35b08..e44909f 100644
---- a/desktop/src/gui/controller.rs
-+++ b/desktop/src/gui/controller.rs
-@@ -106,7 +106,6 @@ impl GuiController {
-             &adapter_info,
-             preferences.graphics_power_preference().into(),
-         );
--        crate::mugetsu::spawn_update_check(window.clone());
-         #[cfg(windows)]
-         if crate::mugetsu::plays_aqw() {
-             crate::windows::add_graphics_menu(&window);
-@@ -361,6 +360,10 @@ impl GuiController {
-                 surface_texture
-             }
-             state @ (wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated) => {
-+                if crate::skua::active() && matches!(state, wgpu::CurrentSurfaceTexture::Lost) {
-+                    tracing::info!("Skua surface lost (host window closed), exiting");
-+                    std::process::exit(0);
-+                }
-                 // Reconfigure the surface if lost or outdated.
-                 // Some sources suggest ignoring `Outdated` and waiting for the next frame,
-                 // but I suspect this advice is related explicitly to resizing,
-@@ -556,6 +559,10 @@ impl GuiController {
-         self.gui.is_context_menu_visible()
-     }
- 
-+    pub fn is_open_url_dialog_visible(&self) -> bool {
-+        self.gui.dialogs.is_open_url_dialog_visible()
-+    }
-+
-     /// AQW build: whether GUI-only repaints are useful: egui shows something, or is about to.
-     pub fn wants_redraws(&self) -> bool {
-         self.ui_visible || self.gui.is_context_menu_visible()
-diff --git a/desktop/src/gui/dialogs.rs b/desktop/src/gui/dialogs.rs
-index c6cbf23..849cd8c 100644
---- a/desktop/src/gui/dialogs.rs
-+++ b/desktop/src/gui/dialogs.rs
-@@ -182,6 +182,10 @@ impl Dialogs {
-         self.open_dialog.options()
-     }
- 
-+    pub fn is_open_url_dialog_visible(&self) -> bool {
-+        self.open_url_dialog.is_some()
-+    }
-+
-     pub fn open_dialog(&mut self, event: DialogDescriptor) {
-         match event {
-             DialogDescriptor::OpenUrl(url) => {
 diff --git a/desktop/src/main.rs b/desktop/src/main.rs
-index 0c50b93..ac5f687 100644
+index 0c50b93f..ac5f6878 100644
 --- a/desktop/src/main.rs
 +++ b/desktop/src/main.rs
 @@ -17,6 +17,7 @@ mod log;
@@ -436,7 +1812,7 @@ index 0c50b93..ac5f687 100644
          if (flag == "--no-gui" && gui) || given(flag) || short.is_some_and(given) {
              continue;
 diff --git a/desktop/src/mugetsu.rs b/desktop/src/mugetsu.rs
-index 0876301..e4a805a 100644
+index 0876301a..0d1c9e53 100644
 --- a/desktop/src/mugetsu.rs
 +++ b/desktop/src/mugetsu.rs
 @@ -10,10 +10,7 @@ use winit::window::Window;
@@ -460,6 +1836,25 @@ index 0876301..e4a805a 100644
  pub fn exe_flag(name: &str) -> bool {
      // Also `name.txt`: Windows hides extensions, so a "new text document" renamed to `name`
      // is really `name.txt`.
+@@ -667,7 +664,7 @@ pub fn exe_flag(name: &str) -> bool {
+ /// Mugetsu asks for the fast graphics card, but on laptops the graphics driver's or Windows'
+ /// per-program setting can still put it on the built-in graphics, which is many times slower.
+ /// If that happened and the PC has a dedicated card, says so (once) and how to switch.
+-pub fn check_gpu_choice(window: Arc<Window>, chosen: &wgpu::AdapterInfo, power: wgpu::PowerPreference) {
++pub fn check_gpu_choice(window: Option<Arc<Window>>, chosen: &wgpu::AdapterInfo, power: wgpu::PowerPreference) {
+     if chosen.device_type == wgpu::DeviceType::IntegratedGpu {
+         let _ = BUILT_IN_GRAPHICS.set(chosen.name.clone());
+     }
+@@ -711,6 +708,8 @@ pub fn check_gpu_choice(window: Arc<Window>, chosen: &wgpu::AdapterInfo, power:
+             );
+             add_title_note("built-in graphics, slower");
+-            window.set_title(&window_title());
++            if let Some(window) = &window {
++                window.set_title(&window_title());
++            }
+ 
+             let Some(dir) = config_dir() else { return };
+             let marker = dir.join("mugetsu-gpu-tip-shown");
 @@ -741,100 +738,6 @@ pub fn check_gpu_choice(window: Arc<Window>, chosen: &wgpu::AdapterInfo, power:
          });
  }
@@ -562,9 +1957,17 @@ index 0876301..e4a805a 100644
  mod intel_tests {
      /// Prints what the Intel check sees on this PC (run with `--nocapture`).
 diff --git a/desktop/src/player.rs b/desktop/src/player.rs
-index b37bdd8..681f265 100644
+index b37bdd8a..681f2650 100644
 --- a/desktop/src/player.rs
 +++ b/desktop/src/player.rs
+@@ -121,6 +121,6 @@ impl ActivePlayer {
+         event_loop: EventLoopProxy<RuffleEvent>,
+         content_descriptor: &ContentDescriptor,
+-        window: Arc<Window>,
++        window: Option<Arc<Window>>,
+         descriptors: Arc<Descriptors>,
+         movie_view: MovieView,
+         font_database: Rc<fontdb::Database>,
 @@ -276,7 +276,10 @@ impl ActivePlayer {
              .expect("Couldn't create wgpu rendering backend");
          RENDER_INFO.with(|i| *i.borrow_mut() = Some(renderer.debug_info().to_string()));
@@ -577,12 +1980,38 @@ index b37bdd8..681f265 100644
              builder = builder.with_external_interface(Box::new(DesktopExternalInterfaceProvider {
                  spoof_url: opt.player.spoof_url.clone(),
              }));
+@@ -342,5 +345,7 @@ impl ActivePlayer {
+         let player = builder.build();
+ 
+-        window.set_title(&crate::window_title()); // AQW build: name the window after the launcher, not the SWF.
++        if let Some(window) = &window {
++            window.set_title(&crate::window_title()); // AQW build: name the window after the launcher, not the SWF.
++        }
+ 
+         SWF_INFO.with(|i| *i.borrow_mut() = Some(readable_name));
+@@ -429,14 +432,14 @@ pub struct PlayerController {
+     player: Option<ActivePlayer>,
+     event_loop: EventLoopProxy<RuffleEvent>,
+-    window: Arc<Window>,
++    window: Option<Arc<Window>>,
+     descriptors: Arc<Descriptors>,
+     font_database: Rc<fontdb::Database>,
+     preferences: GlobalPreferences,
+     file_picker: FilePicker,
+ }
+ 
+ impl PlayerController {
+     pub fn new(
+         event_loop: EventLoopProxy<RuffleEvent>,
+-        window: Arc<Window>,
++        window: Option<Arc<Window>>,
+         descriptors: Arc<Descriptors>,
 diff --git a/desktop/src/skua.rs b/desktop/src/skua.rs
 new file mode 100644
-index 0000000..0d58d53
+index 00000000..b09aae15
 --- /dev/null
 +++ b/desktop/src/skua.rs
-@@ -0,0 +1,286 @@
+@@ -0,0 +1,426 @@
 +//! Skua build: lets Bonxie drive the game and show it inside its own window.
 +//!
 +//! With `--skua-bridge host:port` the player connects to Bonxie over TCP and both sides send one
@@ -590,20 +2019,26 @@ index 0000000..0d58d53
 +//!
 +//! - Bonxie -> player: `{"id":1,"name":"isLoggedIn","args":[]}` calls an `ExternalInterface`
 +//!   callback of the movie, answered with `{"id":1,"r":...}`.
++//! - Bonxie -> player: `{"input":"mouse_move","x":100,"y":200}` (and `resize`, `mouse_btn`,
++//!   `mouse_wheel`, `key`, `text`, `focus`, `clear_keys`) forwards input in `--skua-shm` mode.
 +//! - player -> Bonxie: `{"ev":"loaded","args":[...]}` for every `ExternalInterface.call` of
-+//!   skua.swf (its `Externalizer` sends them all as `skuaCall(name, args)`).
++//!   skua.swf (its `Externalizer` sends them all as `skuaCall(name, args)`), and `{"ev":"frame"}`
++//!   when a new offscreen frame is written to `--skua-shm`.
 +//!
-+//! When Bonxie closes the connection the player exits. `--skua-parent <window handle>` makes the
-+//! window a borderless child of that window.
++//! When Bonxie closes the connection the player exits. `--skua-shm <path>` renders offscreen
++//! into a double-buffered shared-memory file instead of mapping a native window (Wayland).
 +
 +use crate::custom_event::RuffleEvent;
++use memmap2::MmapMut;
 +use ruffle_core::context::UpdateContext;
 +use ruffle_core::external::{ExternalInterfaceProvider, Value as ExternalValue};
 +use serde_json::{Map, Number, Value as Json, json};
 +use std::collections::VecDeque;
++use std::fs::{File, OpenOptions};
 +use std::io::{BufRead, BufReader, Write};
 +use std::net::TcpStream;
-+use std::sync::atomic::{AtomicBool, Ordering};
++use std::path::PathBuf;
++use std::sync::atomic::{AtomicBool, Ordering, fence};
 +use std::sync::{Mutex, OnceLock};
 +use winit::event_loop::EventLoopProxy;
 +
@@ -614,9 +2049,34 @@ index 0000000..0d58d53
 +    pub args: Vec<ExternalValue>,
 +}
 +
++/// Forwarded UI/game input from Bonxie when running offscreen (`--skua-shm`).
++#[derive(Debug, Clone)]
++pub enum SkuaInput {
++    Resize { width: u32, height: u32 },
++    MouseMove { x: f64, y: f64 },
++    MouseButton { button: String, down: bool },
++    MouseWheel { dx: f64, dy: f64 },
++    Key {
++        down: bool,
++        code: String,
++        key: String,
++        ctrl: bool,
++        shift: bool,
++        alt: bool,
++    },
++    Text { text: String },
++    Focus { focused: bool },
++    Visible { visible: bool },
++    ClearKeys,
++}
++
 +static ACTIVE: AtomicBool = AtomicBool::new(false);
++static SHM_ACTIVE: AtomicBool = AtomicBool::new(false);
++static SHM_PATH: OnceLock<PathBuf> = OnceLock::new();
++static SHM_REDRAW_PENDING: AtomicBool = AtomicBool::new(false);
 +static WRITER: OnceLock<Mutex<TcpStream>> = OnceLock::new();
 +static CALLS: Mutex<VecDeque<SkuaCall>> = Mutex::new(VecDeque::new());
++static INPUTS: Mutex<VecDeque<SkuaInput>> = Mutex::new(VecDeque::new());
 +/// Whether a `SkuaWake` is posted or the main thread will look at `CALLS` anyway.
 +///
 +/// Windows only paints (and winit only reaches `about_to_wait`, where the game ticks) once a
@@ -633,6 +2093,116 @@ index 0000000..0d58d53
 +
 +pub fn active() -> bool {
 +    ACTIVE.load(Ordering::Relaxed)
++}
++
++pub fn init_shm(path: PathBuf) {
++    let _ = SHM_PATH.set(path);
++    SHM_ACTIVE.store(true, Ordering::Relaxed);
++}
++
++pub fn shm_active() -> bool {
++    SHM_ACTIVE.load(Ordering::Relaxed)
++}
++
++pub fn request_shm_redraw() {
++    SHM_REDRAW_PENDING.store(true, Ordering::Release);
++}
++
++pub fn take_shm_redraw() -> bool {
++    SHM_REDRAW_PENDING.swap(false, Ordering::AcqRel)
++}
++
++/// Double-buffered shared-memory frame sink (`[64-byte header][slot 0][slot 1]`).
++pub struct ShmBuffer {
++    file: File,
++    mmap: MmapMut,
++    slot_stride: usize,
++    write_slot: u32,
++    seq: u64,
++}
++
++const SHM_HEADER_SIZE: usize = 64;
++const SHM_MAGIC: &[u8; 8] = b"SKUAFRM1";
++
++impl ShmBuffer {
++    pub fn open_from_cli() -> std::io::Result<Self> {
++        let path = SHM_PATH
++            .get()
++            .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "missing --skua-shm path"))?;
++        let file = OpenOptions::new()
++            .read(true)
++            .write(true)
++            .create(true)
++            .open(path)?;
++        let initial_stride = 960 * 550 * 4;
++        file.set_len((SHM_HEADER_SIZE + initial_stride * 2) as u64)?;
++        // SAFETY: only this process writes to the mmap; Bonxie reads only the non-active slot after seq updates.
++        let mut mmap = unsafe { MmapMut::map_mut(&file)? };
++        mmap[0..8].copy_from_slice(SHM_MAGIC);
++        mmap[8..32].fill(0);
++        Ok(Self {
++            file,
++            mmap,
++            slot_stride: initial_stride,
++            write_slot: 0,
++            seq: 0,
++        })
++    }
++
++    pub fn write_frame(
++        &mut self,
++        width: u32,
++        height: u32,
++        padded_bytes_per_row: u32,
++        data: &[u8],
++    ) -> std::io::Result<()> {
++        let row_bytes = (width as usize) * 4;
++        let needed_stride = row_bytes * (height as usize);
++        if needed_stride == 0 {
++            return Ok(());
++        }
++        if needed_stride > self.slot_stride {
++            let new_stride = needed_stride.next_power_of_two().max(needed_stride);
++            self.file
++                .set_len((SHM_HEADER_SIZE + new_stride * 2) as u64)?;
++            // SAFETY: file was resized to hold both slots cleanly.
++            self.mmap = unsafe { MmapMut::map_mut(&self.file)? };
++            self.mmap[0..8].copy_from_slice(SHM_MAGIC);
++            self.slot_stride = new_stride;
++        }
++
++        let slot = self.write_slot;
++        let slot_offset = SHM_HEADER_SIZE + (slot as usize) * self.slot_stride;
++        let dst = &mut self.mmap[slot_offset..slot_offset + needed_stride];
++        let src_stride = padded_bytes_per_row as usize;
++        if src_stride == row_bytes {
++            dst.copy_from_slice(&data[..needed_stride]);
++        } else {
++            for y in 0..(height as usize) {
++                let src_start = y * src_stride;
++                let dst_start = y * row_bytes;
++                dst[dst_start..dst_start + row_bytes]
++                    .copy_from_slice(&data[src_start..src_start + row_bytes]);
++            }
++        }
++
++        self.seq = self.seq.wrapping_add(1);
++        fence(Ordering::Release);
++        self.mmap[8..12].copy_from_slice(&width.to_le_bytes());
++        self.mmap[12..16].copy_from_slice(&height.to_le_bytes());
++        self.mmap[24..28].copy_from_slice(&slot.to_le_bytes());
++        self.mmap[28..32].copy_from_slice(&(self.slot_stride as u32).to_le_bytes());
++        fence(Ordering::Release);
++        self.mmap[16..24].copy_from_slice(&self.seq.to_le_bytes());
++        self.write_slot = 1 - slot;
++
++        notify_frame();
++        Ok(())
++    }
++}
++
++pub fn notify_frame() {
++    send(&json!({ "ev": "frame" }));
 +}
 +
 +/// Connects to Bonxie (once; later movies reuse the connection) and starts reading its calls.
@@ -666,16 +2236,28 @@ index 0000000..0d58d53
 +        .spawn(move || {
 +            for line in reader.lines() {
 +                let Ok(line) = line else { break };
-+                match parse_call(&line) {
-+                    Some(call) => {
-+                        lock(&CALLS).push_back(call);
++                let Ok(msg) = serde_json::from_str::<Json>(&line) else {
++                    tracing::warn!("Skua bridge: bad json {line}");
++                    continue;
++                };
++                if msg.get("input").is_some() {
++                    if let Some(input) = parse_input(&msg) {
++                        lock(&INPUTS).push_back(input);
 +                        if !WAKE_PENDING.swap(true, Ordering::AcqRel)
 +                            && event_loop.send_event(RuffleEvent::SkuaWake).is_err()
 +                        {
 +                            return;
 +                        }
 +                    }
-+                    None => tracing::warn!("Skua bridge: bad message {line}"),
++                } else if let Some(call) = parse_call_json(&msg) {
++                    lock(&CALLS).push_back(call);
++                    if !WAKE_PENDING.swap(true, Ordering::AcqRel)
++                        && event_loop.send_event(RuffleEvent::SkuaWake).is_err()
++                    {
++                        return;
++                    }
++                } else {
++                    tracing::warn!("Skua bridge: bad message {line}");
 +                }
 +            }
 +            tracing::info!("Skua bridge closed, exiting");
@@ -684,8 +2266,7 @@ index 0000000..0d58d53
 +    Ok(())
 +}
 +
-+fn parse_call(line: &str) -> Option<SkuaCall> {
-+    let msg: Json = serde_json::from_str(line).ok()?;
++fn parse_call_json(msg: &Json) -> Option<SkuaCall> {
 +    Some(SkuaCall {
 +        id: msg.get("id")?.as_u64()?,
 +        name: msg.get("name")?.as_str()?.to_string(),
@@ -696,6 +2277,46 @@ index 0000000..0d58d53
 +    })
 +}
 +
++fn parse_input(msg: &Json) -> Option<SkuaInput> {
++    match msg.get("input")?.as_str()? {
++        "resize" => Some(SkuaInput::Resize {
++            width: msg.get("w")?.as_u64()? as u32,
++            height: msg.get("h")?.as_u64()? as u32,
++        }),
++        "mouse_move" => Some(SkuaInput::MouseMove {
++            x: msg.get("x")?.as_f64()?,
++            y: msg.get("y")?.as_f64()?,
++        }),
++        "mouse_btn" => Some(SkuaInput::MouseButton {
++            button: msg.get("button")?.as_str()?.to_string(),
++            down: msg.get("down")?.as_bool()?,
++        }),
++        "mouse_wheel" => Some(SkuaInput::MouseWheel {
++            dx: msg.get("dx").and_then(|v| v.as_f64()).unwrap_or(0.0),
++            dy: msg.get("dy").and_then(|v| v.as_f64()).unwrap_or(0.0),
++        }),
++        "key" => Some(SkuaInput::Key {
++            down: msg.get("down")?.as_bool()?,
++            code: msg.get("code")?.as_str()?.to_string(),
++            key: msg.get("key")?.as_str()?.to_string(),
++            ctrl: msg.get("ctrl").and_then(|v| v.as_bool()).unwrap_or(false),
++            shift: msg.get("shift").and_then(|v| v.as_bool()).unwrap_or(false),
++            alt: msg.get("alt").and_then(|v| v.as_bool()).unwrap_or(false),
++        }),
++        "text" => Some(SkuaInput::Text {
++            text: msg.get("text")?.as_str()?.to_string(),
++        }),
++        "focus" => Some(SkuaInput::Focus {
++            focused: msg.get("focused")?.as_bool()?,
++        }),
++        "visible" => Some(SkuaInput::Visible {
++            visible: msg.get("visible")?.as_bool()?,
++        }),
++        "clear_keys" => Some(SkuaInput::ClearKeys),
++        _ => None,
++    }
++}
++
 +fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 +    mutex.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 +}
@@ -703,6 +2324,11 @@ index 0000000..0d58d53
 +/// The calls received so far, for the main thread to run.
 +pub fn take_calls() -> VecDeque<SkuaCall> {
 +    std::mem::take(&mut *lock(&CALLS))
++}
++
++/// The forwarded input events received so far, for the main thread to run.
++pub fn take_inputs() -> VecDeque<SkuaInput> {
++    std::mem::take(&mut *lock(&INPUTS))
 +}
 +
 +/// Called from `about_to_wait`: calls arriving from now on post a new wake.
@@ -756,62 +2382,6 @@ index 0000000..0d58d53
 +    }
 +}
 +
-+/// Gives the keyboard to the player's window. Windows doesn't move focus to a child window when it
-+/// is clicked (standard controls take it themselves), so without this Bonxie's window keeps it and
-+/// the game gets no keys.
-+#[cfg(windows)]
-+pub fn take_focus(window: &winit::window::Window) {
-+    use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
-+
-+    #[link(name = "user32")]
-+    unsafe extern "system" {
-+        fn SetFocus(hwnd: isize) -> isize;
-+    }
-+
-+    if let Ok(handle) = window.window_handle()
-+        && let RawWindowHandle::Win32(handle) = handle.as_raw()
-+    {
-+        // SAFETY: SetFocus only takes the handle of this live window.
-+        unsafe { SetFocus(handle.hwnd.get()) };
-+    }
-+}
-+
-+/// On X11 the same holds, and winit's `focus_window` only asks the window manager to activate top-level
-+/// windows, so the child window sets the input focus itself (libX11 is loaded at runtime, like winit does).
-+#[cfg(all(unix, not(target_os = "macos")))]
-+pub fn take_focus(window: &winit::window::Window) {
-+    use winit::raw_window_handle::{HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle};
-+    use x11_dl::xlib;
-+
-+    // Main thread only, like every winit window call.
-+    thread_local! {
-+        static XLIB: Option<xlib::Xlib> = xlib::Xlib::open().ok();
-+    }
-+
-+    let (Ok(window_handle), Ok(display_handle)) = (window.window_handle(), window.display_handle()) else {
-+        return;
-+    };
-+    match (window_handle.as_raw(), display_handle.as_raw()) {
-+        (RawWindowHandle::Xlib(window_handle), RawDisplayHandle::Xlib(display_handle)) => XLIB.with(|xlib| {
-+            let (Some(xlib), Some(display)) = (xlib, display_handle.display) else {
-+                return;
-+            };
-+            let display: *mut xlib::Display = display.as_ptr().cast();
-+            // SAFETY: the display and window are winit's live X11 handles for this window.
-+            unsafe {
-+                (xlib.XSetInputFocus)(display, window_handle.window, xlib::RevertToParent, xlib::CurrentTime);
-+                (xlib.XFlush)(display);
-+            }
-+        }),
-+        _ => window.focus_window(),
-+    }
-+}
-+
-+#[cfg(target_os = "macos")]
-+pub fn take_focus(window: &winit::window::Window) {
-+    window.focus_window();
-+}
-+
 +/// skua.swf's `ExternalInterface.call`s, forwarded to Bonxie as events.
 +pub struct SkuaExternalInterface;
 +
@@ -862,11 +2432,9 @@ index 0000000..0d58d53
 +
 +    #[test]
 +    fn parses_calls() {
-+        let call = parse_call(r#"{"id":7,"name":"getGameObject","args":["world.myAvatar"]}"#)
-+            .expect("valid call");
++        let msg: Json = serde_json::from_str(r#"{"id":7,"name":"getGameObject","args":["world.myAvatar"]}"#).unwrap();
++        let call = parse_call_json(&msg).expect("valid call");
 +        assert_eq!((call.id, call.name.as_str()), (7, "getGameObject"));
 +        assert_eq!(call.args, vec![ExternalValue::String("world.myAvatar".into())]);
-+        assert!(parse_call("not json").is_none());
 +    }
 +}
-         if open_url_mode == OpenUrlMode::Confirm {
