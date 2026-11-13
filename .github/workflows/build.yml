@@ -16,9 +16,9 @@ on:
   workflow_dispatch:
     inputs:
       release:
-        description: 'Create a draft release'
+        description: 'Create or update draft release'
         type: boolean
-        default: false
+        default: true
 
 # Read-only by default (pull requests run with this); only the release job writes.
 permissions:
@@ -106,7 +106,7 @@ jobs:
           path: release
 
   release:
-    if: ${{ inputs.release && needs.linux.result == 'success' }}
+    if: ${{ needs.linux.result == 'success' && ((github.event_name == 'push' && github.ref == 'refs/heads/wayland') || (github.event_name == 'workflow_dispatch' && inputs.release)) }}
     needs: [linux]
     runs-on: ubuntu-latest
     permissions:
@@ -129,4 +129,9 @@ jobs:
           notes="source/notes/$VERSION.md"
           if [ ! -f "$notes" ]; then echo "Missing release notes: $notes"; exit 1; fi
           sed -e "s/LINUX_SHA_PLACEHOLDER/$LINUX_SHA/g" "$notes" > notes.md
-          gh release create "v$VERSION" release/* --draft --title "Mugetsu $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
+          if gh release view "v$VERSION" >/dev/null 2>&1; then
+            gh release upload "v$VERSION" release/* --clobber
+            gh release edit "v$VERSION" --notes-file notes.md
+          else
+            gh release create "v$VERSION" release/* --draft --title "Mugetsu $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
+          fi
