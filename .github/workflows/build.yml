@@ -1,15 +1,15 @@
-# Builds Mugetsu for Linux (Wayland) from source/ on GitHub's Linux machines.
+# Builds Mugetsu for Linux (Wayland & X11) from source/ on GitHub's Linux machines.
 #
-# - Every change to source/ on wayland, and every pull request that changes it: test builds,
+# - Every change to source/ on main or wayland, and every pull request that changes it: test builds,
 #   downloadable from the run's page.
-# - Actions > Build Mugetsu > Run workflow, with "Create a draft release" ticked: also makes a
+# - Actions > Build Mugetsu > Run workflow, with "Create or update draft release" ticked: also makes a
 #   draft release with the Linux archives (normal, and x86-64-v2 for CPUs without AVX2) and
 #   their SHA-256 (notes from source/notes/<version>.md), to check and publish by hand.
 name: Build Mugetsu
 
 on:
   push:
-    branches: [wayland]
+    branches: [main, wayland]
     paths: ['source/**', '.github/workflows/build.yml']
   pull_request:
     paths: ['source/**', '.github/workflows/build.yml']
@@ -106,7 +106,7 @@ jobs:
           path: release
 
   release:
-    if: ${{ needs.linux.result == 'success' && ((github.event_name == 'push' && github.ref == 'refs/heads/wayland') || (github.event_name == 'workflow_dispatch' && inputs.release)) }}
+    if: ${{ needs.linux.result == 'success' && ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/wayland')) || (github.event_name == 'workflow_dispatch' && inputs.release)) }}
     needs: [linux]
     runs-on: ubuntu-latest
     permissions:
