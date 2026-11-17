@@ -34,7 +34,7 @@ index 43e19628..4f3b31c5 100644
              Value::Bool(b) => JsonValue::from(b),
              Value::String(s) => JsonValue::from(s.to_utf8_lossy().deref()),
 diff --git a/desktop/src/app.rs b/desktop/src/app.rs
-index 1f648131..f67f8fa8 100644
+index 1f648131..c0dbcd95 100644
 --- a/desktop/src/app.rs
 +++ b/desktop/src/app.rs
 @@ -1123,7 +1123,9 @@ impl MainWindow {
@@ -57,7 +57,7 @@ index 1f648131..f67f8fa8 100644
  
          let (viewport_size, state) = if should_resize {
              let movie_width = swf_header.stage_size().width().to_pixels();
-@@ -1476,7 +1478,175 @@ impl MainWindow {
+@@ -1476,7 +1478,205 @@ impl MainWindow {
          }
      }
  
@@ -220,6 +220,36 @@ index 1f648131..f67f8fa8 100644
 +                SkuaInput::ClearKeys => {
 +                    self.player.handle_event(PlayerEvent::FocusLost);
 +                }
++                SkuaInput::MugetsuSetting { name, value } => {
++                    use crate::mugetsu::{FpsLimit, Performance, Setting};
++                    match name.as_str() {
++                        "performance" => {
++                            let level = match value.trim().to_ascii_lowercase().as_str() {
++                                "balanced" => Performance::Balanced,
++                                "fast" => Performance::Fast,
++                                _ => Performance::Off,
++                            };
++                            self.apply_setting(Setting::Performance(level));
++                        }
++                        "interpolation" => self.apply_setting(Setting::Interpolation(matches!(value.as_str(), "1" | "true" | "on"))),
++                        "uncapped" => self.apply_setting(Setting::Uncapped(matches!(value.as_str(), "1" | "true" | "on"))),
++                        "fps_limit" => {
++                            let limit = match value.trim() {
++                                "screen" => FpsLimit::Screen,
++                                n => n.parse::<u32>().ok().filter(|v| (30..=1000).contains(v)).map_or(FpsLimit::Off, FpsLimit::Fixed),
++                            };
++                            self.apply_setting(Setting::FpsLimit(limit));
++                        }
++                        "memory_limit" => {
++                            if let Ok(mb) = value.trim().parse::<u32>() {
++                                self.apply_setting(Setting::MemoryLimit(mb));
++                            }
++                        }
++                        "free_memory" => self.apply_setting(Setting::FreeMemory),
++                        "show_fps" => self.apply_setting(Setting::ShowFps(matches!(value.as_str(), "1" | "true" | "on"))),
++                        _ => {}
++                    }
++                }
 +            }
 +        }
 +    }
@@ -233,7 +263,7 @@ index 1f648131..f67f8fa8 100644
          if let Some(Event { event, .. }) = gilrs.and_then(|gilrs| gilrs.next_event()) {
              match event {
                  EventType::ButtonPressed(button, _) => {
-@@ -1984,6 +2154,100 @@ impl MainWindow {
+@@ -1984,6 +2184,100 @@ impl MainWindow {
      }
  }
  
@@ -334,7 +364,7 @@ index 1f648131..f67f8fa8 100644
  pub struct App {
      main_window: Option<MainWindow>,
      runtime: Option<tokio::runtime::Runtime>,
-@@ -2199,6 +2463,11 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -2199,6 +2493,11 @@ impl ApplicationHandler<RuffleEvent> for App {
                  }
              }
  
@@ -346,7 +376,7 @@ index 1f648131..f67f8fa8 100644
              (Some(main_window), RuffleEvent::MugetsuSetting(setting)) => {
                  main_window.apply_setting(setting);
              }
-@@ -2316,6 +2585,9 @@ impl ApplicationHandler<RuffleEvent> for App {
+@@ -2316,6 +2615,9 @@ impl ApplicationHandler<RuffleEvent> for App {
          enter_runtime!(self);
  
          if let Some(main_window) = &mut self.main_window {
@@ -538,10 +568,10 @@ index 899a4465..dffef2b3 100644
              }));
 diff --git a/desktop/src/skua.rs b/desktop/src/skua.rs
 new file mode 100644
-index 00000000..0e01196e
+index 00000000..548c9901
 --- /dev/null
 +++ b/desktop/src/skua.rs
-@@ -0,0 +1,308 @@
+@@ -0,0 +1,313 @@
 +//! Skua build: lets Bonxie drive the game and show it inside its own window.
 +//!
 +//! With `--skua-bridge host:port` the player connects to Bonxie over TCP and both sides send one
@@ -593,6 +623,7 @@ index 00000000..0e01196e
 +    Focus { focused: bool },
 +    Visible { visible: bool },
 +    ClearKeys,
++    MugetsuSetting { name: String, value: String },
 +}
 +
 +static ACTIVE: AtomicBool = AtomicBool::new(false);
@@ -725,6 +756,10 @@ index 00000000..0e01196e
 +            visible: msg.get("visible")?.as_bool()?,
 +        }),
 +        "clear_keys" => Some(SkuaInput::ClearKeys),
++        "mugetsu_setting" => Some(SkuaInput::MugetsuSetting {
++            name: msg.get("name")?.as_str()?.to_string(),
++            value: msg.get("value")?.as_str()?.to_string(),
++        }),
 +        _ => None,
 +    }
 +}
