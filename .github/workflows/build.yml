@@ -1,24 +1,29 @@
 # Builds Mugetsu for Linux (Wayland & X11) from source/ on GitHub's Linux machines.
 #
-# - Every change to source/ on main or wayland, and every pull request that changes it: test builds,
+# - Every change to source/ on main, and every pull request that changes it: test builds,
 #   downloadable from the run's page.
-# - Actions > Build Mugetsu > Run workflow, with "Create or update draft release" ticked: also makes a
-#   draft release with the Linux archives (normal, and x86-64-v2 for CPUs without AVX2) and
-#   their SHA-256 (notes from source/notes/<version>.md), to check and publish by hand.
+# - Actions > Build Mugetsu > Run workflow, with "Create or update GitHub release" ticked (or a push to main):
+#   publishes/updates the GitHub release with the Linux archives (x86-64-v3 as linux.tar.gz and
+#   x86-64-v2 as linux-x86-64-v2.tar.gz) and their SHA-256 (notes from source/notes/<version>.md)
+#   for BonxieMux.
 name: Build Mugetsu
 
 on:
   push:
-    branches: [main, wayland]
+    branches: [main]
     paths: ['source/**', '.github/workflows/build.yml']
   pull_request:
     paths: ['source/**', '.github/workflows/build.yml']
   workflow_dispatch:
     inputs:
       release:
-        description: 'Create or update draft release'
+        description: 'Create or update GitHub release'
         type: boolean
         default: true
+      draft:
+        description: 'Create release as draft instead of publishing immediately'
+        type: boolean
+        default: false
 
 # Read-only by default (pull requests run with this); only the release job writes.
 permissions:
@@ -106,7 +111,7 @@ jobs:
           path: release
 
   release:
-    if: ${{ needs.linux.result == 'success' && ((github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/wayland')) || (github.event_name == 'workflow_dispatch' && inputs.release)) }}
+    if: ${{ needs.linux.result == 'success' && ((github.event_name == 'push' && github.ref == 'refs/heads/main') || (github.event_name == 'workflow_dispatch' && inputs.release)) }}
     needs: [linux]
     runs-on: ubuntu-latest
     permissions:
@@ -120,18 +125,25 @@ jobs:
           path: release
           merge-multiple: true
 
-      - name: Draft release
+      - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
           VERSION: ${{ needs.linux.outputs.version }}
-          LINUX_SHA: ${{ needs.linux.outputs.sha }}
+          DRAFT: ${{ github.event_name == 'workflow_dispatch' && inputs.draft }}
         run: |
           notes="source/notes/$VERSION.md"
           if [ ! -f "$notes" ]; then echo "Missing release notes: $notes"; exit 1; fi
-          sed -e "s/LINUX_SHA_PLACEHOLDER/$LINUX_SHA/g" "$notes" > notes.md
+          test -f release/linux.tar.gz
+          test -f release/linux-x86-64-v2.tar.gz
+          LINUX_SHA=$(sha256sum release/linux.tar.gz | cut -d' ' -f1 | tr a-f A-F)
+          LINUX_V2_SHA=$(sha256sum release/linux-x86-64-v2.tar.gz | cut -d' ' -f1 | tr a-f A-F)
+          sed -e "s/LINUX_SHA_PLACEHOLDER/$LINUX_SHA/g" \
+              -e "s/LINUX_V2_SHA_PLACEHOLDER/$LINUX_V2_SHA/g" "$notes" > notes.md
           if gh release view "v$VERSION" >/dev/null 2>&1; then
             gh release upload "v$VERSION" release/* --clobber
             gh release edit "v$VERSION" --notes-file notes.md
           else
-            gh release create "v$VERSION" release/* --draft --title "Mugetsu $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
+            draft_flag=""
+            if [ "$DRAFT" = "true" ]; then draft_flag="--draft"; fi
+            gh release create "v$VERSION" release/* $draft_flag --title "Mugetsu $VERSION" --notes-file notes.md --target "$GITHUB_SHA"
           fi
