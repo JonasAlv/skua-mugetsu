@@ -187,8 +187,8 @@ index 557a8a77..ffe38879 100644
  
  /// Mugetsu's own version. Keep it equal to `ProductVersion` in desktop/Cargo.toml
  /// ([package.metadata.winresource]) and to the GitHub release tag (`v1.1.1`).
--pub const VERSION: &str = "2.0.1";
-+pub const VERSION: &str = "2.0.1-skua.1";
+-pub const VERSION: &str = "2.0.3";
++pub const VERSION: &str = "2.0.3-skua.1";
  
  const RELEASES_API: &str = "https://api.github.com/repos/mugetsu-aqw/mugetsu/releases/latest";
  const RELEASES_PAGE: &str = "https://github.com/mugetsu-aqw/mugetsu/releases/latest";
