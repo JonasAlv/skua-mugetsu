@@ -57,8 +57,14 @@ jobs:
 
       - name: Install libraries
         run: |
-          sudo apt-get update
-          sudo apt-get install -y libasound2-dev libudev-dev libfontconfig-dev libfreetype6-dev libssl-dev
+          pkgs="libasound2-dev libudev-dev libfontconfig-dev libfreetype6-dev libssl-dev"
+          apt_opts="-o Acquire::Retries=5 -o Acquire::http::Timeout=30"
+          if ! (sudo apt-get $apt_opts update && sudo apt-get $apt_opts install -y --fix-missing $pkgs); then
+            echo "Default Ubuntu mirror failed; falling back to archive.ubuntu.com..."
+            sudo sed -i 's|http://azure\.archive\.ubuntu\.com/ubuntu|http://archive.ubuntu.com/ubuntu|g' /etc/apt/apt-mirrors.txt /etc/apt/sources.list 2>/dev/null || true
+            sudo apt-get $apt_opts update
+            sudo apt-get $apt_opts install -y --fix-missing $pkgs
+          fi
 
       - name: Install Rust
         run: |
